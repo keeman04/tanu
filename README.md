@@ -48,6 +48,8 @@ GitHub Actions runs on macOS and performs:
 - unsigned generic iPhone compilation
 - CI artifact packaging
 
+The CI gate is bootstrapped on `main`, so pull requests can be compiled and tested before merge.
+
 The CI `.app` artifact is a simulator build. A physical-iPhone `.ipa` requires Apple signing credentials and a provisioning profile; those credentials are intentionally not stored in this public repository.
 
 ## API-key security
