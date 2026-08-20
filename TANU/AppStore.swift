@@ -90,7 +90,8 @@ final class AppStore: ObservableObject {
             meeting.status = .transcribing
             meeting.endedAt = Date()
         }
-        await recorder.stop()
+
+        let transcriptionCompleted = await recorder.stop(finalizationTimeoutSeconds: 120)
 
         guard let index = meetings.firstIndex(where: { $0.id == id }) else { return }
         let transcript = meetings[index].transcript.map(\.text).joined(separator: "\n")
@@ -113,7 +114,10 @@ final class AppStore: ObservableObject {
             meeting.status = .ready
             meeting.errorMessage = recorder.lastError
         }
-        recorder.cleanup(meetingID: id)
+
+        if transcriptionCompleted, recorder.lastError == nil {
+            recorder.cleanup(meetingID: id)
+        }
         activeMeetingID = nil
     }
 
