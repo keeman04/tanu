@@ -1,6 +1,6 @@
 name: TANU
 options:
-  bundleIdPrefix: com.tanu
+  bundleIdPrefix: com.keeman04
   deploymentTarget:
     iOS: "17.0"
 settings:
@@ -19,7 +19,7 @@ targets:
       - path: TANU
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tanu.personal
+        PRODUCT_BUNDLE_IDENTIFIER: com.keeman04.tanu.personal
         INFOPLIST_FILE: TANU/Info.plist
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
@@ -32,7 +32,8 @@ targets:
       - target: TANU
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tanu.personal.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.keeman04.tanu.personal.tests
+        CODE_SIGN_STYLE: Automatic
 
 schemes:
   TANU:
