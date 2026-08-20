@@ -63,7 +63,7 @@ final class SpeechTranscriber: @unchecked Sendable {
             taskBox.set(task)
 
             Task.detached(priority: .utility) {
-                try? await Task.sleep(nanoseconds: 90_000_000_000)
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
                 if gate.finish(.failure(SpeechError.timeout)) {
                     taskBox.cancel()
                 }
