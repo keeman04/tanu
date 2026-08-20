@@ -98,3 +98,5 @@ First confirm:
 - Developer Mode is enabled if requested.
 
 If the bundle identifier is reported as unavailable, change it in Signing & Capabilities to another unique value such as `com.keeman04.tanu.personal2`, then build again.
+
+This free-install branch is also submitted directly against `main` so the repository's macOS/Xcode CI can validate the complete source build independently of Personal Team signing.
