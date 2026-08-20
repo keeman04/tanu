@@ -19,29 +19,53 @@ final class OpenAIService {
         let boundedTranscript = String(transcript.prefix(120_000))
         let prompt = """
         You are TANU, a meeting minutes assistant. Convert the transcript below into concise minutes of meeting.
-        Return ONLY valid JSON with exactly these keys:
-        {"summary":"string","decisions":["string"],"actions":["string"],"followUps":["string"]}
-        Do not invent names, dates, decisions, owners, or commitments that are not in the transcript.
+        Do not invent names, dates, decisions, owners, deadlines, or commitments that are not present in the transcript.
+        Keep the summary concise and put concrete commitments in actions. Put explicit decisions in decisions and unresolved next steps in followUps.
 
         TRANSCRIPT:
         \(boundedTranscript)
         """
 
+        let schema: [String: Any] = [
+            "type": "object",
+            "properties": [
+                "summary": ["type": "string"],
+                "decisions": ["type": "array", "items": ["type": "string"]],
+                "actions": ["type": "array", "items": ["type": "string"]],
+                "followUps": ["type": "array", "items": ["type": "string"]]
+            ],
+            "required": ["summary", "decisions", "actions", "followUps"],
+            "additionalProperties": false
+        ]
+
+        let body: [String: Any] = [
+            "model": "gpt-5.4-mini",
+            "input": prompt,
+            "store": false,
+            "reasoning": ["effort": "none"],
+            "text": [
+                "format": [
+                    "type": "json_schema",
+                    "name": "tanu_mom",
+                    "strict": true,
+                    "schema": schema
+                ]
+            ]
+        ]
+
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
         request.httpMethod = "POST"
-        request.timeoutInterval = 45
+        request.timeoutInterval = 60
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "model": "gpt-5.6-luna",
-            "input": prompt
-        ])
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpShouldSetCookies = false
-        configuration.timeoutIntervalForRequest = 45
-        configuration.timeoutIntervalForResource = 60
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 75
         let session = URLSession(configuration: configuration)
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
@@ -53,8 +77,7 @@ final class OpenAIService {
             .first(where: { $0.type == "output_text" })?.text
         guard let outputText else { throw APIError.invalidResponse }
 
-        let cleaned = stripCodeFences(outputText)
-        guard let payloadData = cleaned.data(using: .utf8),
+        guard let payloadData = outputText.data(using: .utf8),
               let payload = try? JSONDecoder().decode(MOMPayload.self, from: payloadData),
               !payload.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw APIError.invalidMOM
@@ -68,16 +91,6 @@ final class OpenAIService {
             generatedAt: Date(),
             source: "openai"
         )
-    }
-
-    private func stripCodeFences(_ text: String) -> String {
-        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if value.hasPrefix("```") {
-            value = value.replacingOccurrences(of: "```json", with: "")
-            value = value.replacingOccurrences(of: "```JSON", with: "")
-            value = value.replacingOccurrences(of: "```", with: "")
-        }
-        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
