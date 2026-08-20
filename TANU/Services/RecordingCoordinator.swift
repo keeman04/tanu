@@ -49,7 +49,7 @@ final class RecordingCoordinator: NSObject, ObservableObject, AVAudioRecorderDel
         transcriptionTasks.removeAll()
         transcriptionTail = nil
 
-        try audioSession.setCategory(.record, mode: .measurement, options: [.allowBluetoothHFP])
+        try audioSession.setCategory(.record, mode: .measurement, options: [.allowBluetooth])
         try? audioSession.setPreferredSampleRate(16_000)
         try audioSession.setActive(true)
 
@@ -199,14 +199,14 @@ final class RecordingCoordinator: NSObject, ObservableObject, AVAudioRecorderDel
     }
 
     private func requestMicrophonePermission() async -> Bool {
-        switch audioSession.recordPermission {
+        switch AVAudioApplication.shared.recordPermission {
         case .granted:
             return true
         case .denied:
             return false
         case .undetermined:
             return await withCheckedContinuation { continuation in
-                audioSession.requestRecordPermission { granted in
+                AVAudioApplication.requestRecordPermission { granted in
                     continuation.resume(returning: granted)
                 }
             }
