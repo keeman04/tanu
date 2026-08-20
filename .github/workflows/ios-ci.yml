@@ -71,10 +71,18 @@ jobs:
 
       - name: Package CI artifacts
         run: |
+          set -euo pipefail
           mkdir -p artifacts
           ditto -c -k --sequesterRsrc --keepParent build/DerivedData/Build/Products/Debug-iphonesimulator/TANU.app artifacts/TANU-iOS-Simulator.app.zip
+          DEVICE_APP=build/DeviceDerivedData/Build/Products/Release-iphoneos/TANU.app
+          test -d "$DEVICE_APP"
+          rm -rf build/UnsignedPayload
+          mkdir -p build/UnsignedPayload/Payload
+          ditto "$DEVICE_APP" build/UnsignedPayload/Payload/TANU.app
+          (cd build/UnsignedPayload && zip -qry ../../artifacts/TANU-iOS-Unsigned-for-Signing.ipa Payload)
           cp README.md SECURITY.md artifacts/
           shasum -a 256 artifacts/TANU-iOS-Simulator.app.zip > artifacts/TANU-iOS-Simulator.app.zip.sha256
+          shasum -a 256 artifacts/TANU-iOS-Unsigned-for-Signing.ipa > artifacts/TANU-iOS-Unsigned-for-Signing.ipa.sha256
 
       - name: Upload CI app
         uses: actions/upload-artifact@v4
