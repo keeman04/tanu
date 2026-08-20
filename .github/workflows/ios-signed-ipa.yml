@@ -1,0 +1,190 @@
+name: Build Signed TANU iPhone IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  signed-ipa:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      BUNDLE_ID: com.tanu.personal
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Validate required signing secrets
+        shell: bash
+        env:
+          IOS_DISTRIBUTION_CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          IOS_DISTRIBUTION_CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          IOS_ADHOC_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_ADHOC_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$IOS_DISTRIBUTION_CERTIFICATE_BASE64" || { echo "::error::Missing IOS_DISTRIBUTION_CERTIFICATE_BASE64"; exit 1; }
+          test -n "$IOS_DISTRIBUTION_CERTIFICATE_PASSWORD" || { echo "::error::Missing IOS_DISTRIBUTION_CERTIFICATE_PASSWORD"; exit 1; }
+          test -n "$IOS_ADHOC_PROVISIONING_PROFILE_BASE64" || { echo "::error::Missing IOS_ADHOC_PROVISIONING_PROFILE_BASE64"; exit 1; }
+          test -n "$APPLE_TEAM_ID" || { echo "::error::Missing APPLE_TEAM_ID"; exit 1; }
+          echo "Required Apple signing secrets are present."
+
+      - name: Import Apple Distribution certificate
+        shell: bash
+        env:
+          IOS_DISTRIBUTION_CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          IOS_DISTRIBUTION_CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-tanu
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/tanu-distribution.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/tanu-signing.keychain-db"
+          printf '%s' "$IOS_DISTRIBUTION_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$IOS_DISTRIBUTION_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Install and validate Ad Hoc provisioning profile
+        id: profile
+        shell: bash
+        env:
+          IOS_ADHOC_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_ADHOC_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          PROFILE_PATH="$RUNNER_TEMP/tanu.mobileprovision"
+          PROFILE_PLIST="$RUNNER_TEMP/tanu-profile.plist"
+          printf '%s' "$IOS_ADHOC_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")
+          PROFILE_TEAM=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")
+          PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")
+          test "$PROFILE_TEAM" = "$APPLE_TEAM_ID" || { echo "::error::Provisioning profile team does not match APPLE_TEAM_ID"; exit 1; }
+          test "$PROFILE_APP_ID" = "$APPLE_TEAM_ID.$BUNDLE_ID" || { echo "::error::Provisioning profile App ID must exactly match $BUNDLE_ID"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices:0' "$PROFILE_PLIST" >/dev/null || { echo "::error::Profile is not an Ad Hoc/development device profile"; exit 1; }
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          echo "name=$PROFILE_NAME" >> "$GITHUB_OUTPUT"
+          echo "uuid=$PROFILE_UUID" >> "$GITHUB_OUTPUT"
+          echo "Provisioning profile validated for $BUNDLE_ID."
+
+      - name: Archive signed TANU app
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ steps.profile.outputs.name }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project TANU.xcodeproj \
+            -scheme TANU \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/TANU.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY='Apple Distribution' \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            clean archive
+
+      - name: Export installable IPA
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ steps.profile.outputs.name }}
+        run: |
+          set -euo pipefail
+          EXPORT_METHOD='release-testing'
+          if ! xcodebuild -help 2>&1 | grep -q 'release-testing'; then
+            EXPORT_METHOD='ad-hoc'
+          fi
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>$EXPORT_METHOD</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
+            <key>teamID</key>
+            <string>$APPLE_TEAM_ID</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_ID</key>
+              <string>$PROFILE_NAME</string>
+            </dict>
+            <key>stripSwiftSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          mkdir -p build/export
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$RUNNER_TEMP/TANU.xcarchive" \
+            -exportPath build/export \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+          IPA_PATH=$(find build/export -maxdepth 1 -name '*.ipa' -print -quit)
+          test -n "$IPA_PATH"
+          cp "$IPA_PATH" build/export/TANU-iOS-v1-iPhone.ipa
+
+      - name: Verify signed IPA
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/ipa-check"
+          mkdir -p "$RUNNER_TEMP/ipa-check"
+          unzip -q build/export/TANU-iOS-v1-iPhone.ipa -d "$RUNNER_TEMP/ipa-check"
+          APP_PATH=$(find "$RUNNER_TEMP/ipa-check/Payload" -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          test -f "$APP_PATH/embedded.mobileprovision"
+          security cms -D -i "$APP_PATH/embedded.mobileprovision" > "$RUNNER_TEMP/embedded-profile.plist"
+          EMBEDDED_APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/embedded-profile.plist")
+          test "$EMBEDDED_APP_ID" = "$APPLE_TEAM_ID.$BUNDLE_ID"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist" | grep -qx "$BUNDLE_ID"
+          shasum -a 256 build/export/TANU-iOS-v1-iPhone.ipa | tee build/export/TANU-iOS-v1-iPhone.ipa.sha256
+
+      - name: Upload signed iPhone IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TANU-iOS-v1-Signed-iPhone-IPA
+          path: |
+            build/export/TANU-iOS-v1-iPhone.ipa
+            build/export/TANU-iOS-v1-iPhone.ipa.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Delete temporary signing keychain
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+          rm -f "$RUNNER_TEMP/tanu-distribution.p12" "$RUNNER_TEMP/tanu.mobileprovision" "$RUNNER_TEMP/tanu-profile.plist" "$RUNNER_TEMP/embedded-profile.plist" || true
