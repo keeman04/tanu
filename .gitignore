@@ -1,0 +1,15 @@
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+TANU.xcodeproj/
+
+# Secrets
+.env
+Secrets.xcconfig
+*.p12
+*.mobileprovision
+
+# macOS
+.DS_Store
