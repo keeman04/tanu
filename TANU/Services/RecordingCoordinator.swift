@@ -33,6 +33,7 @@ final class RecordingCoordinator: NSObject, ObservableObject, AVAudioRecorderDel
     private var rotateTimer: DispatchSourceTimer?
     private var elapsedTask: Task<Void, Never>?
     private var transcriptionTail: Task<Void, Never>?
+    private var transcriptionTasks: [Task<Void, Never>] = []
     private var onSegment: ((String) -> Void)?
 
     init(files: SecureFileStore) {
@@ -44,6 +45,10 @@ final class RecordingCoordinator: NSObject, ObservableObject, AVAudioRecorderDel
         guard await requestMicrophonePermission() else { throw RecordingError.microphoneDenied }
         guard await speech.requestAuthorization() else { throw RecordingError.speechDenied }
 
+        transcriptionTasks.forEach { $0.cancel() }
+        transcriptionTasks.removeAll()
+        transcriptionTail = nil
+
         try audioSession.setCategory(.record, mode: .measurement, options: [.allowBluetoothHFP])
         try? audioSession.setPreferredSampleRate(16_000)
         try audioSession.setActive(true)
@@ -54,14 +59,14 @@ final class RecordingCoordinator: NSObject, ObservableObject, AVAudioRecorderDel
         elapsedSeconds = 0
         queuedChunks = 0
         lastError = nil
-        transcriptionTail = nil
         try startChunk()
         isRecording = true
         startTimers()
     }
 
-    func stop() async {
-        guard meetingID != nil else { return }
+    @discardableResult
+    func stop(finalizationTimeoutSeconds: UInt64 = 120) async -> Bool {
+        guard meetingID != nil else { return true }
         rotateTimer?.cancel()
         rotateTimer = nil
         elapsedTask?.cancel()
@@ -74,10 +79,18 @@ final class RecordingCoordinator: NSObject, ObservableObject, AVAudioRecorderDel
         currentChunkURL = nil
         if let finalURL { enqueueTranscription(finalURL) }
 
-        let tail = transcriptionTail
-        await tail?.value
+        let completed = await waitForTranscription(transcriptionTail, timeoutSeconds: finalizationTimeoutSeconds)
+        if !completed {
+            transcriptionTasks.forEach { $0.cancel() }
+            lastError = "TANU stopped waiting after two minutes. The MOM uses the transcript completed so far, and the meeting audio is kept for recovery."
+        }
+
         try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
         onSegment = nil
+        meetingID = nil
+        transcriptionTail = nil
+        transcriptionTasks.removeAll()
+        return completed
     }
 
     func cleanup(meetingID: UUID) {
@@ -147,19 +160,41 @@ final class RecordingCoordinator: NSObject, ObservableObject, AVAudioRecorderDel
     private func enqueueTranscription(_ url: URL) {
         let previous = transcriptionTail
         queuedChunks += 1
-        transcriptionTail = Task { [weak self] in
+        let task = Task { [weak self] in
             _ = await previous?.value
             guard let self else { return }
             defer { self.queuedChunks = max(0, self.queuedChunks - 1) }
+            guard !Task.isCancelled else { return }
             do {
                 let text = try await self.speech.transcribe(fileURL: url)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !Task.isCancelled else { return }
                 if !text.isEmpty {
                     self.onSegment?(text)
                 }
             } catch {
-                self.lastError = "A recording chunk is saved but could not be transcribed yet: \(error.localizedDescription)"
+                guard !Task.isCancelled else { return }
+                self.lastError = "A recording chunk is saved but could not be transcribed: \(error.localizedDescription)"
             }
+        }
+        transcriptionTail = task
+        transcriptionTasks.append(task)
+    }
+
+    private func waitForTranscription(_ task: Task<Void, Never>?, timeoutSeconds: UInt64) async -> Bool {
+        guard let task else { return true }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await task.value
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
         }
     }
 
