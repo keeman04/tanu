@@ -1,0 +1,85 @@
+name: Build TANU iOS
+
+on:
+  push:
+    branches: [ ios-v1 ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Security checks
+        run: |
+          ! grep -R -E 'sk-[A-Za-z0-9_-]{20,}' TANU TANUTests .github README.md SECURITY.md
+          ! grep -R 'NSAllowsArbitraryLoads.*true' TANU
+          grep -q 'kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly' TANU/Security/KeychainStore.swift
+          grep -q 'completeUntilFirstUserAuthentication' TANU/Security/SecureFileStore.swift
+          grep -q 'completeUnlessOpen' TANU/Security/SecureFileStore.swift
+          grep -q '<string>audio</string>' TANU/Info.plist
+          grep -q '55' TANU/Services/RecordingCoordinator.swift
+          grep -q 'MomEngine.generate' TANU/AppStore.swift
+
+      - name: Select simulator
+        id: simulator
+        shell: bash
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; data=json.load(sys.stdin); devices=[d for group in data["devices"].values() for d in group if d.get("isAvailable") and d.get("name", "").startswith("iPhone")]; print(devices[0]["udid"] if devices else "")')
+          test -n "$UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$UDID" || true
+
+      - name: Run unit tests
+        run: |
+          xcodebuild \
+            -project TANU.xcodeproj \
+            -scheme TANU \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: Build unsigned iPhone binary
+        run: |
+          xcodebuild \
+            -project TANU.xcodeproj \
+            -scheme TANU \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DeviceDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package CI artifacts
+        run: |
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent build/DerivedData/Build/Products/Debug-iphonesimulator/TANU.app artifacts/TANU-iOS-Simulator.app.zip
+          cp README.md SECURITY.md artifacts/
+          shasum -a 256 artifacts/TANU-iOS-Simulator.app.zip > artifacts/TANU-iOS-Simulator.app.zip.sha256
+
+      - name: Upload CI app
+        uses: actions/upload-artifact@v4
+        with:
+          name: TANU-iOS-v1-CI
+          path: artifacts/
+          retention-days: 30
+          if-no-files-found: error
