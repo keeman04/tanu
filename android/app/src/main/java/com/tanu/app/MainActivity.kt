@@ -83,9 +83,9 @@ class MainActivity : Activity() {
 
     private fun buildUi(): View {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 40, 40, 40) }
-        root.addView(TextView(this).apply { text = "TANU"; textSize = 30f })
-        root.addView(TextView(this).apply { text = "Android Phase 1 • long-meeting pipeline"; textSize = 15f })
-        title = EditText(this).apply { hint = "Meeting title"; setText("TANU Meeting") }
+        root.addView(TextView(this).apply { text = "Meeting Assistant and Intelligence"; textSize = 30f })
+        root.addView(TextView(this).apply { text = "Personal meeting intelligence • long-meeting pipeline"; textSize = 15f })
+        title = EditText(this).apply { hint = "Meeting title"; setText("New Meeting") }
         root.addView(title)
         root.addView(Button(this).apply { text = "Start Meeting"; setOnClickListener { startMeeting() } })
         stopButton = Button(this).apply { text = "Stop & Generate MOM"; isEnabled = false; setOnClickListener { stopMeeting() } }
@@ -113,7 +113,7 @@ class MainActivity : Activity() {
         val id = UUID.randomUUID().toString()
         meetingId = id
         getPreferences(MODE_PRIVATE).edit().putString("meeting_id", id).apply()
-        val cleanTitle = title.text.toString().trim().ifBlank { "TANU Meeting" }
+        val cleanTitle = title.text.toString().trim().ifBlank { "New Meeting" }
         uiScope.launch { dao.upsertMeeting(MeetingEntity(id, cleanTitle, System.currentTimeMillis())) }
         transcript.text = "Waiting for the first transcript chunk…"
         mom.text = "MOM will appear after Stop."
@@ -162,8 +162,8 @@ class MainActivity : Activity() {
         uiScope.launch {
             val meeting = withContext(Dispatchers.IO) { dao.meeting(id) } ?: return@launch
             val parsed = meeting.finalMomJson?.let { runCatching { Mom.fromJson(it, meeting.finalMomSource) }.getOrNull() } ?: return@launch
-            val text = "TANU — Minutes of Meeting\n${meeting.title}\n\n${parsed.displayText()}"
-            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Share TANU MOM"))
+            val text = "Meeting Assistant and Intelligence — Minutes of Meeting\n${meeting.title}\n\n${parsed.displayText()}"
+            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Share MOM"))
         }
     }
 
