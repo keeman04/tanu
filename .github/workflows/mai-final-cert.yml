@@ -47,7 +47,7 @@ jobs:
       fail-fast: false
       matrix:
         api-level: [29, 35]
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +56,11 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
