@@ -101,6 +101,10 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
         writableDatabase.update("meetings", ContentValues().apply { put("status", "processing") }, "id=?", arrayOf(id))
     }
 
+    fun markReady(id: String) {
+        writableDatabase.update("meetings", ContentValues().apply { put("status", "ready") }, "id=?", arrayOf(id))
+    }
+
     fun updateTranscript(id: String, transcript: String) {
         if (transcript.isBlank()) return
         writableDatabase.update("meetings", ContentValues().apply { put("transcript", transcript) }, "id=?", arrayOf(id))
