@@ -1,6 +1,7 @@
 package com.mai.app.recording
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -14,16 +15,36 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.mai.app.MainActivity
 import com.mai.app.R
 import com.mai.app.data.MaiDb
 import com.mai.app.intelligence.MomEngine
+import com.mai.app.pipeline.AudioChunkEntity
+import com.mai.app.pipeline.ChunkState
+import com.mai.app.pipeline.ChunkUploadWorker
+import com.mai.app.pipeline.CloudApi
+import com.mai.app.pipeline.FinalizeMeetingWorker
+import com.mai.app.pipeline.MaiPipelineDatabase
+import com.mai.app.pipeline.PipelineFiles
+import com.mai.app.pipeline.PipelineMeetingEntity
+import com.mai.app.pipeline.PipelineRecovery
+import com.mai.app.pipeline.SpeechChunkEncoder
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.vosk.Recognizer
 import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
+import java.io.FileOutputStream
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.sqrt
 
 class RecordingService : Service() {
@@ -33,14 +54,24 @@ class RecordingService : Service() {
         const val EXTRA_MEETING_ID = "meeting_id"
         private const val CHANNEL = "mai_recording"
         private const val NOTIFICATION_ID = 1001
-        private const val SAMPLE_RATE = 16000
+        private const val SAMPLE_RATE = 16_000
+        private const val FRAME_MS = 20
+        private const val FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS / 1000
+        private const val TARGET_CHUNK_MS = 15_000L
+        private const val MAX_CHUNK_MS = 20_000L
+        private const val SILENCE_TO_CUT_MS = 320L
+        private const val SILENCE_RMS_THRESHOLD = 0.012
     }
 
-    private val running = AtomicBoolean(false)
-    private var thread: Thread? = null
-    private var wakeLock: PowerManager.WakeLock? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val encoder = SpeechChunkEncoder()
+    private val encodeMutex = Mutex()
+    private val pendingEncodes = AtomicInteger(0)
+    @Volatile private var stopRequested = false
+    @Volatile private var recording = false
     private var meetingId: String? = null
     private var startedAt = 0L
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -51,191 +82,268 @@ class RecordingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_STOP -> stopRecording()
-            ACTION_START -> if (!running.get()) startRecording(intent.getStringExtra(EXTRA_MEETING_ID))
+            ACTION_START -> {
+                val id = intent.getStringExtra(EXTRA_MEETING_ID)
+                if (!id.isNullOrBlank() && !recording) {
+                    startForeground(NOTIFICATION_ID, notification("Starting microphone", 0L))
+                    scope.launch { runRecording(id) }
+                }
+            }
+            ACTION_STOP -> {
+                stopRequested = true
+                RecordingBus.update { it.copy(status = "finishing") }
+                updateNotification("Finishing meeting", elapsed())
+            }
         }
-        return START_NOT_STICKY
+        return START_REDELIVER_INTENT
     }
 
-    private fun startRecording(id: String?) {
-        if (id.isNullOrBlank()) {
-            stopSelf()
-            return
+    @SuppressLint("MissingPermission")
+    private suspend fun runRecording(id: String) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            RecordingBus.update { it.copy(error = "Microphone permission missing", status = "error") }
+            finishService(); return
         }
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            RecordingBus.update { it.copy(error = "Microphone permission missing") }
-            stopSelf()
-            return
-        }
-
+        val mainDb = MaiDb(this)
+        val meeting = mainDb.getMeeting(id) ?: run { finishService(); return }
+        val dao = MaiPipelineDatabase.get(this).dao()
         meetingId = id
-        startedAt = System.currentTimeMillis()
-        startForeground(NOTIFICATION_ID, notification("Recording", 0L))
-        wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MAI:Recording")
-            .apply { acquire() }
-        running.set(true)
-        RecordingBus.update {
-            RecordingSnapshot(active = true, meetingId = id, startedAt = startedAt, status = "recording")
-        }
-
-        // Audio capture is started independently. Vosk is allowed to warm up in the
-        // background only after the meeting is already active; recording never waits.
+        startedAt = meeting.startedAt
+        stopRequested = false
+        recording = true
+        persistActive(id)
+        dao.upsertMeeting(PipelineMeetingEntity(id, meeting.title, meeting.startedAt, "recording"))
+        PipelineRecovery.schedule(this)
         SpeechModelHolder.ensureForRecording(this)
-        thread = Thread({ captureLoop(id) }, "mai-audio").apply { start() }
-    }
+        acquireWakeLock()
 
-    private fun captureLoop(id: String) {
-        val min = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        val bufferSize = maxOf(4096, min * 2)
-        val audio = AudioRecord(
+        val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val recorder = AudioRecord(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize
+            maxOf(minBuffer, FRAME_BYTES * 8)
         )
-        val audioDir = File(filesDir, "audio").apply { mkdirs() }
-        val output = File(audioDir, "$id.aac")
-        var sink: AacAdtsSink? = null
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            RecordingBus.update { it.copy(error = "Microphone failed to initialize", status = "error") }
+            recorder.release(); finishService(); return
+        }
+
+        val dbMax = dao.maxSequence(id)
+        val tempMax = PipelineFiles.tempPcmFiles(this, id).maxOfOrNull { PipelineFiles.sequenceFromName(it.name) } ?: -1
+        var sequence = maxOf(dbMax, tempMax) + 1
+        var chunkStartMs = elapsed()
+        var pcmFile = PipelineFiles.tempPcm(this, id, sequence)
+        var output = FileOutputStream(pcmFile)
+        var bytesInChunk = 0L
+        var silenceMs = 0L
+        val frame = ByteArray(FRAME_BYTES)
+        val localTranscript = StringBuilder()
         var recognizer: Recognizer? = null
-        val transcript = StringBuilder()
-        var audioSafe = false
+        var lastUi = 0L
+        var lastHeartbeat = 0L
 
+        RecordingBus.update { RecordingSnapshot(active = true, meetingId = id, startedAt = startedAt, status = "recording") }
         try {
-            sink = AacAdtsSink(output)
-            if (audio.state != AudioRecord.STATE_INITIALIZED) {
-                throw IllegalStateException("Microphone failed to initialize")
-            }
-            audio.startRecording()
-            val buffer = ByteArray(bufferSize)
-            var lastUi = 0L
+            recorder.startRecording()
+            while (!stopRequested && scope.isActive) {
+                var collected = 0
+                while (collected < frame.size && !stopRequested) {
+                    val read = recorder.read(frame, collected, frame.size - collected)
+                    if (read > 0) collected += read
+                    else if (read < 0) throw IllegalStateException("Microphone read failed: $read")
+                }
+                if (collected <= 0) continue
 
-            while (running.get()) {
-                val read = audio.read(buffer, 0, buffer.size)
-                if (read <= 0) continue
-
-                // Audio is always written before any optional AI/STT work.
-                sink.writePcm(buffer, read)
-                audioSafe = audioSafe || output.length() > 512
+                // Source audio is persisted before any speech/AI work.
+                output.write(frame, 0, collected)
+                bytesInChunk += collected
+                val frameDurationMs = (collected / 2L) * 1000L / SAMPLE_RATE
+                silenceMs = if (isSilent(frame, collected)) silenceMs + frameDurationMs else 0L
 
                 if (recognizer == null) {
-                    SpeechModelHolder.model?.let { loadedModel ->
-                        recognizer = runCatching {
-                            Recognizer(loadedModel, SAMPLE_RATE.toFloat()).apply { setWords(true) }
-                        }.getOrNull()
+                    SpeechModelHolder.model?.let { model ->
+                        recognizer = runCatching { Recognizer(model, SAMPLE_RATE.toFloat()).apply { setWords(true) } }.getOrNull()
                     }
                 }
-
-                val rms = rms(buffer, read)
-                val level = normalize(rms)
                 var partial = ""
-                val activeRecognizer = recognizer
-                if (activeRecognizer != null) {
-                    val accepted = runCatching { activeRecognizer.acceptWaveForm(buffer, read) }.getOrDefault(false)
+                recognizer?.let { r ->
+                    val accepted = runCatching { r.acceptWaveForm(frame, collected) }.getOrDefault(false)
                     if (accepted) {
-                        val text = runCatching { JSONObject(activeRecognizer.result).optString("text").trim() }
-                            .getOrDefault("")
+                        val text = runCatching { JSONObject(r.result).optString("text").trim() }.getOrDefault("")
                         if (text.isNotBlank()) {
-                            if (transcript.isNotEmpty()) transcript.append('\n')
-                            transcript.append(text)
+                            if (localTranscript.isNotEmpty()) localTranscript.append('\n')
+                            localTranscript.append(text)
                         }
                     } else {
-                        partial = runCatching {
-                            JSONObject(activeRecognizer.partialResult).optString("partial").trim()
-                        }.getOrDefault("")
+                        partial = runCatching { JSONObject(r.partialResult).optString("partial").trim() }.getOrDefault("")
                     }
                 }
 
                 val now = System.currentTimeMillis()
-                if (now - lastUi >= 80) {
+                val level = normalizeRms(frame, collected)
+                if (now - lastUi >= 100L) {
                     lastUi = now
                     RecordingBus.update { old ->
-                        val nextLevels = (old.levels + level).takeLast(48)
                         old.copy(
                             active = true,
                             meetingId = id,
+                            startedAt = startedAt,
                             elapsedMs = now - startedAt,
                             level = level,
-                            levels = nextLevels,
-                            transcript = transcript.toString(),
+                            levels = (old.levels + level).takeLast(48),
+                            transcript = localTranscript.toString(),
                             partial = partial,
-                            audioSafe = audioSafe,
-                            status = when {
-                                recognizer == null -> "recording"
-                                level < 0.035f -> "waiting"
-                                else -> "voice"
-                            }
+                            audioSafe = bytesInChunk > 512 || sequence > 0,
+                            status = if (level <= 0f) "waiting" else "voice"
                         )
                     }
-                    updateNotification(now - startedAt)
+                    updateNotification("Recording · audio safe", now - startedAt)
                 }
-            }
+                if (now - lastHeartbeat >= 2_000L) {
+                    lastHeartbeat = now
+                    heartbeat(id)
+                }
 
-            recognizer?.let { r ->
-                val finalText = runCatching { JSONObject(r.finalResult).optString("text").trim() }
-                    .getOrDefault("")
-                if (finalText.isNotBlank()) {
-                    if (transcript.isNotEmpty()) transcript.append('\n')
-                    transcript.append(finalText)
+                val chunkDuration = bytesInChunk * 1000L / (SAMPLE_RATE * 2L)
+                if ((chunkDuration >= TARGET_CHUNK_MS && silenceMs >= SILENCE_TO_CUT_MS) || chunkDuration >= MAX_CHUNK_MS) {
+                    runCatching { output.fd.sync() }
+                    output.close()
+                    val endMs = chunkStartMs + chunkDuration
+                    queueEncoding(id, sequence, pcmFile, chunkStartMs, endMs)
+                    sequence++
+                    chunkStartMs = endMs
+                    pcmFile = PipelineFiles.tempPcm(this, id, sequence)
+                    output = FileOutputStream(pcmFile)
+                    bytesInChunk = 0L
+                    silenceMs = 0L
                 }
             }
         } catch (t: Throwable) {
-            RecordingBus.update { it.copy(error = t.message ?: "Recording error", status = "error") }
+            RecordingBus.update { it.copy(error = t.message ?: "Recording error", status = "partial") }
         } finally {
-            runCatching { audio.stop() }
-            runCatching { audio.release() }
-            runCatching { recognizer?.close() }
-            runCatching { sink?.close() }
-            finalizeMeeting(id, output, transcript.toString())
+            runCatching { output.flush() }
+            runCatching { output.fd.sync() }
+            runCatching { output.close() }
+            runCatching { recorder.stop() }
+            recorder.release()
+            recognizer?.let { r ->
+                val finalText = runCatching { JSONObject(r.finalResult).optString("text").trim() }.getOrDefault("")
+                if (finalText.isNotBlank()) {
+                    if (localTranscript.isNotEmpty()) localTranscript.append('\n')
+                    localTranscript.append(finalText)
+                }
+                runCatching { r.close() }
+            }
+            recording = false
         }
-    }
 
-    private fun finalizeMeeting(id: String, output: File, transcript: String) {
-        val db = MaiDb(this)
-        val meeting = db.getMeeting(id)
-        if (meeting != null) {
-            val mom = MomEngine.generate(transcript, meeting.participants, meeting.startedAt)
-            val retentionDays = getSharedPreferences("mai_settings", MODE_PRIVATE)
-                .getInt("audio_retention_days", 7)
-            val ended = System.currentTimeMillis()
-            db.finishMeeting(
-                id = id,
-                endedAt = ended,
-                transcript = transcript,
-                summary = mom.summary,
-                decisions = mom.decisions,
-                actions = mom.actions,
-                audioPath = output.absolutePath,
-                audioExpiresAt = ended + retentionDays * 86_400_000L
-            )
-        }
+        val finalHasAudio = pcmFile.exists() && pcmFile.length() > 0L
+        if (finalHasAudio) {
+            val duration = pcmFile.length() * 1000L / (SAMPLE_RATE * 2L)
+            queueEncoding(id, sequence, pcmFile, chunkStartMs, chunkStartMs + duration)
+        } else pcmFile.delete()
+        val expectedChunks = if (finalHasAudio) sequence + 1 else sequence
+
+        RecordingBus.update { it.copy(status = "securing", partial = "") }
+        waitForEncodes()
+        val ended = System.currentTimeMillis()
+        val localText = localTranscript.toString().trim()
+        val localMom = MomEngine.generate(localText, meeting.participants, meeting.startedAt)
+        val retentionDays = getSharedPreferences("mai_settings", MODE_PRIVATE).getInt("audio_retention_days", 0)
+        val expires = if (retentionDays <= 0) null else ended + retentionDays * 86_400_000L
+        val cloud = CloudApi(this).configured
+        mainDb.finishMeeting(
+            id = id,
+            endedAt = ended,
+            transcript = localText,
+            summary = localMom.summary,
+            decisions = localMom.decisions,
+            actions = localMom.actions,
+            followUps = localMom.followUps,
+            audioPath = PipelineFiles.audioDir(this, id).absolutePath,
+            audioExpiresAt = expires,
+            status = if (cloud) "processing" else "ready"
+        )
+        dao.updateMeetingState(id, if (cloud) "finalizing" else "local_only", expectedChunks)
+        if (cloud) FinalizeMeetingWorker.enqueue(this, id) else PipelineRecovery.schedule(this)
+
         RecordingBus.update {
-            it.copy(
-                active = false,
-                partial = "",
-                status = "ready",
-                elapsedMs = System.currentTimeMillis() - startedAt,
-                audioSafe = output.exists() && output.length() > 0
-            )
+            it.copy(active = false, meetingId = id, elapsedMs = ended - startedAt, partial = "", transcript = localText,
+                audioSafe = expectedChunks > 0, status = "ready")
         }
-        releaseWakeLock()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        clearActive()
+        finishService()
     }
 
-    private fun stopRecording() {
-        if (running.compareAndSet(true, false)) thread?.interrupt() else stopSelf()
+    private fun queueEncoding(meetingId: String, sequence: Int, pcmFile: File, startMs: Long, endMs: Long) {
+        pendingEncodes.incrementAndGet()
+        scope.launch {
+            try {
+                val encoded = encodeMutex.withLock { encoder.encode(pcmFile, PipelineFiles.encodedBase(this@RecordingService, meetingId, sequence)) }
+                val chunk = AudioChunkEntity(
+                    meetingId = meetingId,
+                    sequence = sequence,
+                    localPath = encoded.file.absolutePath,
+                    startMs = startMs,
+                    endMs = endMs,
+                    durationMs = endMs - startMs,
+                    sizeBytes = encoded.file.length(),
+                    sha256 = PipelineFiles.sha256(encoded.file),
+                    codec = encoded.codec,
+                    mimeType = encoded.mimeType,
+                    state = ChunkState.QUEUED
+                )
+                MaiPipelineDatabase.get(this@RecordingService).dao().upsertChunk(chunk)
+                pcmFile.delete()
+                ChunkUploadWorker.enqueue(this@RecordingService, meetingId, sequence)
+            } catch (t: Throwable) {
+                RecordingBus.update { it.copy(error = "A saved chunk is waiting for recovery: ${t.message.orEmpty()}", status = "partial") }
+            } finally {
+                pendingEncodes.decrementAndGet()
+            }
+        }
     }
 
-    override fun onDestroy() {
-        if (running.compareAndSet(true, false)) thread?.interrupt()
-        releaseWakeLock()
-        super.onDestroy()
+    private suspend fun waitForEncodes() {
+        val deadline = android.os.SystemClock.elapsedRealtime() + 60_000L
+        while (pendingEncodes.get() > 0 && android.os.SystemClock.elapsedRealtime() < deadline) delay(150L)
+    }
+
+    private fun isSilent(bytes: ByteArray, count: Int): Boolean {
+        var sum = 0.0
+        var samples = 0
+        var i = 0
+        while (i + 1 < count) {
+            val sample = ((bytes[i + 1].toInt() shl 8) or (bytes[i].toInt() and 0xff)).toShort().toInt()
+            sum += sample.toDouble() * sample
+            samples++
+            i += 2
+        }
+        if (samples == 0) return true
+        return sqrt(sum / samples) / 32768.0 < SILENCE_RMS_THRESHOLD
+    }
+
+    private fun normalizeRms(bytes: ByteArray, count: Int): Float {
+        var sum = 0.0
+        var samples = 0
+        var i = 0
+        while (i + 1 < count) {
+            val sample = ((bytes[i + 1].toInt() shl 8) or (bytes[i].toInt() and 0xff)).toShort().toInt()
+            sum += sample.toDouble() * sample
+            samples++
+            i += 2
+        }
+        val rms = if (samples == 0) 0.0 else sqrt(sum / samples)
+        val normalized = (rms / 6000.0).coerceIn(0.0, 1.0).toFloat()
+        return if (normalized < 0.035f) 0f else normalized
+    }
+
+    private fun acquireWakeLock() {
+        wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MAI:LongMeeting")
+            .apply { acquire(10 * 60 * 60 * 1000L) }
     }
 
     private fun releaseWakeLock() {
@@ -243,44 +351,52 @@ class RecordingService : Service() {
         wakeLock = null
     }
 
-    private fun rms(bytes: ByteArray, length: Int): Double {
-        var sum = 0.0
-        var count = 0
-        var i = 0
-        while (i + 1 < length) {
-            val sample = ((bytes[i + 1].toInt() shl 8) or (bytes[i].toInt() and 0xff)).toShort().toInt()
-            sum += sample.toDouble() * sample
-            count++
-            i += 2
-        }
-        return if (count == 0) 0.0 else sqrt(sum / count)
+    private fun persistActive(id: String) {
+        getSharedPreferences("mai_recording", MODE_PRIVATE).edit()
+            .putString("active_meeting_id", id).putLong("active_heartbeat", System.currentTimeMillis()).apply()
     }
 
-    private fun normalize(rms: Double): Float {
-        val raw = (rms / 6000.0).coerceIn(0.0, 1.0).toFloat()
-        return if (raw < 0.035f) 0f else raw
+    private fun heartbeat(id: String) {
+        getSharedPreferences("mai_recording", MODE_PRIVATE).edit()
+            .putString("active_meeting_id", id).putLong("active_heartbeat", System.currentTimeMillis()).apply()
+    }
+
+    private fun clearActive() {
+        getSharedPreferences("mai_recording", MODE_PRIVATE).edit().clear().apply()
+    }
+
+    private fun elapsed(): Long = (System.currentTimeMillis() - startedAt).coerceAtLeast(0L)
+
+    private fun finishService() {
+        stopRequested = false
+        recording = false
+        releaseWakeLock()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        if (!recording) clearActive()
+        releaseWakeLock()
+        scope.cancel()
+        super.onDestroy()
     }
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(
-                    NotificationChannel(CHANNEL, "MAI recording", NotificationManager.IMPORTANCE_LOW)
-                )
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL, "MAI recording", NotificationManager.IMPORTANCE_LOW)
+            )
         }
     }
 
     private fun notification(status: String, elapsed: Long): android.app.Notification {
         val stop = PendingIntent.getService(
-            this,
-            2,
-            Intent(this, RecordingService::class.java).setAction(ACTION_STOP),
+            this, 2, Intent(this, RecordingService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val open = PendingIntent.getActivity(
-            this,
-            1,
-            Intent(this, MainActivity::class.java),
+            this, 1, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL)
@@ -293,9 +409,8 @@ class RecordingService : Service() {
             .build()
     }
 
-    private fun updateNotification(elapsed: Long) {
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-            .notify(NOTIFICATION_ID, notification("Recording", elapsed))
+    private fun updateNotification(status: String, elapsed: Long) {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(status, elapsed))
     }
 
     private fun formatElapsed(ms: Long): String {
