@@ -49,7 +49,7 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Android 35 launcher cold-start test
+      - name: Android 35 repeated launcher smoke tests
         id: launcher-smoke
         continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
@@ -58,27 +58,14 @@ jobs:
           arch: x86_64
           profile: pixel_2
           disable-animations: false
-          script: |
-            gradle --no-daemon assembleDebug
-            adb install -r app/build/outputs/apk/debug/app-debug.apk
-            adb logcat -c || true
-            adb shell am force-stop com.mai.app || true
-            adb shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.mai.app/.MainActivity
-            sleep 45
-            adb logcat -d -v threadtime > android-logcat.txt || true
-            adb shell dumpsys activity activities > android-activities.txt || true
-            ! grep -q "Process: com.mai.app" android-logcat.txt
-            grep -q "topResumedActivity=ActivityRecord.*com.mai.app/.MainActivity" android-activities.txt
-            touch mai-launch-smoke-passed
+          script: bash scripts/mai_launcher_smoke.sh
 
       - name: Upload cold-start diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: MAI-cold-start-diagnostics
-          path: |
-            android-logcat.txt
-            android-activities.txt
+          path: cold-start-diagnostics/
           retention-days: 7
           if-no-files-found: warn
 
