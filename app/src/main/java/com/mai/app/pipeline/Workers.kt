@@ -117,21 +117,32 @@ class FinalizeMeetingWorker(context: Context, params: WorkerParameters) : Corout
         val meetingId = inputData.getString(KEY_MEETING_ID) ?: return Result.failure()
         val dao = MaiPipelineDatabase.get(applicationContext).dao()
         val api = CloudApi(applicationContext)
+        val pipelineMeeting = dao.meeting(meetingId) ?: return Result.failure()
         if (!api.configured) {
-            dao.meeting(meetingId)?.let { dao.updateMeetingState(meetingId, "local_only", it.expectedChunks) }
+            dao.updateMeetingState(meetingId, "local_only", pipelineMeeting.expectedChunks)
             return Result.success()
         }
+
         val chunks = dao.chunks(meetingId)
+        val expected = pipelineMeeting.expectedChunks ?: chunks.size
+        if (chunks.size < expected) {
+            // A PCM file may still be waiting for encoding after a crash or a slow final encode.
+            // Never lower the expected count merely because that recovered chunk is late.
+            PipelineRecovery.schedule(applicationContext)
+            return if (runAttemptCount < 12) Result.retry() else Result.failure()
+        }
+
         chunks.filter { it.state in setOf(ChunkState.RECORDED, ChunkState.QUEUED, ChunkState.UPLOADING, ChunkState.FAILED) }
             .forEach { ChunkUploadWorker.enqueue(applicationContext, meetingId, it.sequence) }
         if (chunks.any { it.state !in setOf(ChunkState.UPLOADED, ChunkState.TRANSCRIBING, ChunkState.TRANSCRIBED) }) {
             return if (runAttemptCount < 12) Result.retry() else Result.failure()
         }
+
         val meeting = MaiDb(applicationContext).getMeeting(meetingId) ?: return Result.failure()
         return try {
             api.ensureMeeting(meeting)
-            api.finalizeMeeting(meetingId, chunks.size)
-            dao.updateMeetingState(meetingId, "processing", chunks.size)
+            api.finalizeMeeting(meetingId, expected)
+            dao.updateMeetingState(meetingId, "processing", expected)
             val update = api.fetchUpdates(meetingId)
             update.chunks.filter { !it.text.isNullOrBlank() }.forEach { server ->
                 dao.upsertTranscript(TranscriptSegmentEntity(meetingId, server.sequence, server.startMs, server.endMs, server.text!!))
@@ -141,7 +152,7 @@ class FinalizeMeetingWorker(context: Context, params: WorkerParameters) : Corout
             val mom = api.fetchMom(meetingId)
             if (mom != null) {
                 MaiDb(applicationContext).applyCloudResult(meetingId, transcript, mom.summary, mom.decisions, mom.actions, mom.followUps)
-                dao.updateMeetingState(meetingId, "ready", chunks.size)
+                dao.updateMeetingState(meetingId, "ready", expected)
                 Result.success()
             } else {
                 SyncMeetingWorker.enqueue(applicationContext, meetingId, 3)
