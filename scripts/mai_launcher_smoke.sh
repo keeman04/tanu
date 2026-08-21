@@ -64,5 +64,9 @@ assert_launch "repeat-3"
 adb shell pm revoke "$PACKAGE" android.permission.READ_CONTACTS || true
 assert_launch "contacts-revoked"
 
-echo "All MAI launcher smoke tests passed."
+# Android runtime integration tests cover launch survival plus meeting data lifecycle:
+# create -> finish -> search -> complete action -> delete, and checkpoint recovery.
+gradle --no-daemon connectedDebugAndroidTest
+
+echo "All MAI launcher and Android integration tests passed."
 touch mai-launch-smoke-passed
