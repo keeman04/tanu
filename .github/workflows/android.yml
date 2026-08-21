@@ -1,14 +1,14 @@
-name: MAI Android
+name: MAI Launch Candidate
 on:
   push:
-    branches: [ main, mai-production, fix-launch-icon-crash ]
+    branches: [ main, mai-production, fix-launch-icon-crash, mai-v1-launch-ready ]
   pull_request:
     branches: [ main ]
 
 jobs:
-  build:
+  android-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v5
@@ -21,17 +21,45 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Unit tests
+      - name: JVM unit tests
         run: gradle --no-daemon testDebugUnitTest
-      - name: Build APK
+      - name: Android lint
+        run: gradle --no-daemon lintDebug
+      - name: Build debug APK
         run: gradle --no-daemon assembleDebug
-      - name: Upload APK
+      - name: Compile release candidate
+        run: gradle --no-daemon assembleRelease
+      - name: Upload installable launch candidate
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.0.1-Android
+          name: MAI-V1.1.0-Launch-Candidate
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
           if-no-files-found: error
+      - name: Upload unsigned release output
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAI-V1.1.0-Unsigned-Release
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+          if-no-files-found: warn
+
+  backend-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend
+        run: pip install -r backend/requirements.txt
+      - name: MAI API contract tests
+        run: python -m unittest -v backend.test_app
+      - name: Python syntax check
+        run: python -m compileall -q backend
 
   cold-start-smoke:
     strategy:
@@ -39,7 +67,7 @@ jobs:
       matrix:
         api-level: [29, 35]
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v5
@@ -64,11 +92,11 @@ jobs:
           disable-animations: false
           script: bash scripts/mai_launcher_smoke.sh
 
-      - name: Upload cold-start diagnostics
+      - name: Upload launcher diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-cold-start-diagnostics-api-${{ matrix.api-level }}
+          name: MAI-launch-diagnostics-api-${{ matrix.api-level }}
           path: cold-start-diagnostics/
           retention-days: 7
           if-no-files-found: warn
