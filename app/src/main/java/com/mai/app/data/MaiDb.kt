@@ -55,10 +55,7 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
         )
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // v2 keeps the same SQL columns; action completion is stored inside actions JSON.
-        // Opening v1 data therefore needs no destructive migration.
-    }
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
 
     fun createMeeting(title: String, participants: List<Participant>, startedAt: Long = System.currentTimeMillis()): String {
         require(participants.isNotEmpty()) { "At least one participant is required" }
@@ -109,13 +106,32 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
         }, "id=?", arrayOf(id))
     }
 
+    fun replaceIntelligence(
+        id: String,
+        transcript: String,
+        summary: String,
+        decisions: List<String>,
+        actions: List<ActionRecord>
+    ) {
+        val existing = getMeeting(id) ?: return
+        val completed = existing.actions.filter { it.done }.associateBy { normalizeAction(it.text) }
+        val mergedActions = actions.map { action ->
+            action.copy(done = completed[normalizeAction(action.text)]?.done == true)
+        }
+        writableDatabase.update("meetings", ContentValues().apply {
+            put("transcript", transcript)
+            put("summary", summary)
+            put("decisions", JSONArray(decisions).toString())
+            put("actions", actionsToJson(mergedActions))
+            put("status", "ready")
+        }, "id=?", arrayOf(id))
+    }
+
     fun updateActionDone(meetingId: String, actionIndex: Int, done: Boolean) {
         val meeting = getMeeting(meetingId) ?: return
         if (actionIndex !in meeting.actions.indices) return
         val updated = meeting.actions.toMutableList().also { it[actionIndex] = it[actionIndex].copy(done = done) }
-        writableDatabase.update("meetings", ContentValues().apply {
-            put("actions", actionsToJson(updated))
-        }, "id=?", arrayOf(meetingId))
+        writableDatabase.update("meetings", ContentValues().apply { put("actions", actionsToJson(updated)) }, "id=?", arrayOf(meetingId))
     }
 
     fun markAudioDeleted(id: String) {
@@ -208,4 +224,9 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
         val arr = JSONArray(raw)
         (0 until arr.length()).map { arr.getString(it) }
     }.getOrDefault(emptyList())
+
+    private fun normalizeAction(text: String): String = text.lowercase()
+        .replace(Regex("[^a-z0-9 ]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
 }
