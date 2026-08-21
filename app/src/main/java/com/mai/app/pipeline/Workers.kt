@@ -83,7 +83,7 @@ class SyncMeetingWorker(context: Context, params: WorkerParameters) : CoroutineW
             val transcript = dao.transcript(meetingId).joinToString("\n") { it.text }.trim()
             if (transcript.isNotBlank()) MaiDb(applicationContext).updateTranscript(meetingId, transcript)
             val pipelineMeeting = dao.meeting(meetingId)
-            if (pipelineMeeting?.state in setOf("finalizing", "processing")) {
+            if (pipelineMeeting != null && pipelineMeeting.state in setOf("finalizing", "processing")) {
                 val mom = api.fetchMom(meetingId)
                 if (mom != null) {
                     MaiDb(applicationContext).applyCloudResult(meetingId, transcript, mom.summary, mom.decisions, mom.actions, mom.followUps)
@@ -91,7 +91,9 @@ class SyncMeetingWorker(context: Context, params: WorkerParameters) : CoroutineW
                     return Result.success()
                 }
             }
-            if (update.pendingChunks > 0 || pipelineMeeting?.state in setOf("finalizing", "processing")) enqueue(applicationContext, meetingId, 4)
+            if (update.pendingChunks > 0 || (pipelineMeeting != null && pipelineMeeting.state in setOf("finalizing", "processing"))) {
+                enqueue(applicationContext, meetingId, 4)
+            }
             Result.success()
         } catch (_: Throwable) {
             if (runAttemptCount < 10) Result.retry() else Result.failure()
@@ -126,8 +128,6 @@ class FinalizeMeetingWorker(context: Context, params: WorkerParameters) : Corout
         val chunks = dao.chunks(meetingId)
         val expected = pipelineMeeting.expectedChunks ?: chunks.size
         if (chunks.size < expected) {
-            // A PCM file may still be waiting for encoding after a crash or a slow final encode.
-            // Never lower the expected count merely because that recovered chunk is late.
             PipelineRecovery.schedule(applicationContext)
             return if (runAttemptCount < 12) Result.retry() else Result.failure()
         }
