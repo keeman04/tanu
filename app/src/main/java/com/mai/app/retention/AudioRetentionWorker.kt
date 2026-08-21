@@ -11,7 +11,10 @@ class AudioRetentionWorker(context: Context, params: WorkerParameters) : Corouti
         val db = MaiDb(applicationContext)
         db.expiredAudio(System.currentTimeMillis()).forEach { meeting ->
             val path = meeting.audioPath ?: return@forEach
-            runCatching { File(path).delete() }
+            runCatching {
+                val file = File(path)
+                if (file.isDirectory) file.deleteRecursively() else file.delete()
+            }
             db.markAudioDeleted(meeting.id)
         }
         return Result.success()
