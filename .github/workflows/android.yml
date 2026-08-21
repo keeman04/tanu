@@ -1,7 +1,7 @@
 name: MAI Android
 on:
   push:
-    branches: [ main, mai-production, fix-launch-icon-crash ]
+    branches: [ main, mai-production, fix-launch-icon-crash, mai-launch-ready ]
   pull_request:
     branches: [ main ]
 
@@ -28,7 +28,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.0.1-Android
+          name: MAI-V1.1.0-RC1-Android
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
           if-no-files-found: error
@@ -52,7 +52,6 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-
       - name: Android ${{ matrix.api-level }} repeated launcher smoke tests
         id: launcher-smoke
         continue-on-error: true
@@ -63,7 +62,6 @@ jobs:
           profile: pixel_2
           disable-animations: false
           script: bash scripts/mai_launcher_smoke.sh
-
       - name: Upload cold-start diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,6 +70,5 @@ jobs:
           path: cold-start-diagnostics/
           retention-days: 7
           if-no-files-found: warn
-
       - name: Enforce MAI launcher result
         run: test -f mai-launch-smoke-passed
