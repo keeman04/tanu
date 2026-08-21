@@ -1,7 +1,7 @@
 name: MAI Android
 on:
   push:
-    branches: [ main, mai-production, fix-launch-icon-crash, mai-launch-ready ]
+    branches: [ main, mai-production, fix-launch-icon-crash ]
   pull_request:
     branches: [ main ]
 
