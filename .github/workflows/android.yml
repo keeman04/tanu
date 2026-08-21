@@ -33,13 +33,33 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+  backend-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+      - name: Backend unit tests
+        run: PYTHONPATH=. pytest -q
+      - name: Validate backend module
+        run: python -m py_compile app.py
+
   cold-start-smoke:
     strategy:
       fail-fast: false
       matrix:
         api-level: [29, 35]
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v5
@@ -52,7 +72,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Android ${{ matrix.api-level }} repeated launcher smoke tests
+      - name: Android ${{ matrix.api-level }} launcher and integration tests
         id: launcher-smoke
         continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
@@ -62,13 +82,15 @@ jobs:
           profile: pixel_2
           disable-animations: false
           script: bash scripts/mai_launcher_smoke.sh
-      - name: Upload cold-start diagnostics
+      - name: Upload Android diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-cold-start-diagnostics-api-${{ matrix.api-level }}
-          path: cold-start-diagnostics/
+          name: MAI-diagnostics-api-${{ matrix.api-level }}
+          path: |
+            cold-start-diagnostics/
+            app/build/reports/androidTests/
           retention-days: 7
           if-no-files-found: warn
-      - name: Enforce MAI launcher result
+      - name: Enforce MAI Android result
         run: test -f mai-launch-smoke-passed
