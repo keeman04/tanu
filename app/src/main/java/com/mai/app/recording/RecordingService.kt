@@ -68,8 +68,6 @@ class RecordingService : Service() {
             return
         }
 
-        // Never block a meeting because STT is still warming up. Audio capture starts first.
-        SpeechModelHolder.ensure(this)
         meetingId = id
         startedAt = System.currentTimeMillis()
         startForeground(NOTIFICATION_ID, notification("Recording", 0L))
@@ -81,6 +79,9 @@ class RecordingService : Service() {
             RecordingSnapshot(active = true, meetingId = id, startedAt = startedAt, status = "recording")
         }
 
+        // Audio capture is started independently. Vosk is allowed to warm up in the
+        // background only after the meeting is already active; recording never waits.
+        SpeechModelHolder.ensureForRecording(this)
         thread = Thread({ captureLoop(id) }, "mai-audio").apply { start() }
     }
 
