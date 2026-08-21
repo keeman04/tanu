@@ -59,24 +59,16 @@ jobs:
           profile: pixel_2
           disable-animations: true
           script: |
-            set +e
-            STATUS=0
-            gradle --no-daemon assembleDebug || STATUS=1
-            adb install -r app/build/outputs/apk/debug/app-debug.apk || STATUS=1
+            gradle --no-daemon assembleDebug
+            adb install -r app/build/outputs/apk/debug/app-debug.apk
             adb logcat -c || true
             adb shell am force-stop com.mai.app || true
-            adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.mai.app/.MainActivity || STATUS=1
-            sleep 15
-            PID="$(adb shell pidof com.mai.app 2>/dev/null | tr -d '\r')"
+            adb shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.mai.app/.MainActivity || true
+            sleep 45
             adb logcat -d -v threadtime > android-logcat.txt || true
             adb shell dumpsys activity activities > android-activities.txt || true
-            if [ -z "$PID" ]; then
-              echo "MAI process is not alive after cold start"
-              STATUS=1
-            else
-              echo "MAI process survived cold start with PID $PID"
-            fi
-            exit $STATUS
+            ! grep -q "Process: com.mai.app" android-logcat.txt
+            grep -q "topResumedActivity=ActivityRecord.*com.mai.app/.MainActivity" android-activities.txt
 
       - name: Upload cold-start diagnostics
         if: always()
