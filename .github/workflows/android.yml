@@ -26,7 +26,17 @@ jobs:
         with:
           gradle-version: '8.9'
       - name: JVM unit tests
-        run: gradle --no-daemon testDebugUnitTest
+        run: |
+          set -o pipefail
+          gradle --no-daemon testDebugUnitTest 2>&1 | tee jvm-test.log
+      - name: Upload JVM diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAI-jvm-test-diagnostics
+          path: jvm-test.log
+          retention-days: 7
+          if-no-files-found: warn
       - name: Android lint
         run: gradle --no-daemon lintDebug
       - name: Build debug APK
