@@ -106,6 +106,9 @@ interface TanuDao {
     @Query("UPDATE meetings SET finalMomJson = :json, finalMomSource = :source, state = 'ready' WHERE id = :id")
     suspend fun saveFinalMom(id: String, json: String, source: String)
 
+    @Query("UPDATE meetings SET finalMomJson = :json, finalMomSource = :source, state = 'partial' WHERE id = :id")
+    suspend fun saveFallbackMom(id: String, json: String, source: String)
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertChunk(chunk: AudioChunkEntity)
 
@@ -130,7 +133,7 @@ interface TanuDao {
     @Query("SELECT COALESCE(SUM(sizeBytes),0) FROM audio_chunks WHERE meetingId = :meetingId")
     suspend fun localAudioBytes(meetingId: String): Long
 
-    @Query("SELECT * FROM audio_chunks WHERE state IN ('recorded','queued','failed') ORDER BY meetingId, sequence")
+    @Query("SELECT * FROM audio_chunks WHERE state IN ('recorded','queued','uploading','failed') ORDER BY meetingId, sequence")
     suspend fun recoverableChunks(): List<AudioChunkEntity>
 
     @Query("UPDATE audio_chunks SET state = :state, retryCount = :retryCount, lastError = :error WHERE meetingId = :meetingId AND sequence = :sequence")
@@ -169,11 +172,8 @@ abstract class TanuDatabase : RoomDatabase() {
     companion object {
         @Volatile private var INSTANCE: TanuDatabase? = null
         fun get(context: Context): TanuDatabase = INSTANCE ?: synchronized(this) {
-            INSTANCE ?: Room.databaseBuilder(
-                context.applicationContext,
-                TanuDatabase::class.java,
-                "tanu.db"
-            ).build().also { INSTANCE = it }
+            INSTANCE ?: Room.databaseBuilder(context.applicationContext, TanuDatabase::class.java, "tanu.db")
+                .build().also { INSTANCE = it }
         }
     }
 }

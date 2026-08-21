@@ -5,8 +5,10 @@ import java.io.File
 import java.security.MessageDigest
 
 object PipelineFiles {
+    fun meetingsRoot(context: Context): File = File(context.filesDir, "meetings").apply { mkdirs() }
+
     fun meetingDir(context: Context, meetingId: String): File =
-        File(context.filesDir, "meetings/$meetingId").apply { mkdirs() }
+        File(meetingsRoot(context), meetingId).apply { mkdirs() }
 
     fun audioDir(context: Context, meetingId: String): File =
         File(meetingDir(context, meetingId), "audio").apply { mkdirs() }
@@ -14,8 +16,16 @@ object PipelineFiles {
     fun tempPcm(context: Context, meetingId: String, sequence: Int): File =
         File(audioDir(context, meetingId), "chunk-${sequence.toString().padStart(6, '0')}.pcm.tmp")
 
+    fun tempPcmFiles(context: Context, meetingId: String): List<File> =
+        audioDir(context, meetingId).listFiles { file -> file.name.endsWith(".pcm.tmp") }
+            ?.sortedBy { sequenceFromName(it.name) }.orEmpty()
+
     fun encodedBase(context: Context, meetingId: String, sequence: Int): File =
         File(audioDir(context, meetingId), "chunk-${sequence.toString().padStart(6, '0')}.audio")
+
+    fun sequenceFromName(name: String): Int = name.removePrefix("chunk-")
+        .substringBefore('.')
+        .toIntOrNull() ?: -1
 
     fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")

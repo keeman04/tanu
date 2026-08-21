@@ -4,9 +4,9 @@ import json
 import os
 import sqlite3
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -25,6 +25,7 @@ DISABLE_WORKERS = os.getenv("TANU_DISABLE_WORKERS", "0") == "1"
 MAX_CHUNK_BYTES = 2 * 1024 * 1024
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+rolling_locks: dict[str, asyncio.Lock] = {}
 
 
 def now_ms() -> int:
@@ -39,8 +40,17 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def db_session() -> Iterator[sqlite3.Connection]:
+    conn = db_connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def init_db() -> None:
-    with db_connect() as db:
+    with db_session() as db:
         db.executescript(
             """
             CREATE TABLE IF NOT EXISTS meetings (
@@ -49,6 +59,7 @@ def init_db() -> None:
                 started_at_ms INTEGER NOT NULL,
                 created_at_ms INTEGER NOT NULL,
                 state TEXT NOT NULL DEFAULT 'recording',
+                expected_chunks INTEGER,
                 final_mom_json TEXT,
                 final_error TEXT
             );
@@ -88,6 +99,9 @@ def init_db() -> None:
             );
             """
         )
+        columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(meetings)").fetchall()}
+        if "expected_chunks" not in columns:
+            db.execute("ALTER TABLE meetings ADD COLUMN expected_chunks INTEGER")
         db.execute("UPDATE chunks SET state='uploaded' WHERE state='transcribing'")
 
 
@@ -106,6 +120,10 @@ class MeetingCreate(BaseModel):
     id: str = Field(min_length=8, max_length=128)
     title: str = Field(default="Meeting", min_length=1, max_length=300)
     started_at_ms: int
+
+
+class FinalizeRequest(BaseModel):
+    expected_chunks: int = Field(ge=0, le=100_000)
 
 
 class ActionItem(BaseModel):
@@ -205,26 +223,23 @@ async def responses_json(prompt: str, schema_name: str, schema: dict[str, Any]) 
     output = extract_output_text(response.json())
     if not output:
         raise RuntimeError("Responses API returned no output_text")
-    parsed = json.loads(output)
-    return parsed
+    return json.loads(output)
 
 
 async def transcribe_file(path: Path, mime_type: str) -> str:
     prompt = (
         "TANU meeting transcript. Preserve natural English, Tamil, and Tanglish/code-switched speech. "
         "Do not translate Tamil into English unless the speaker did so. Preserve names, numbers, dates, "
-        "companies, commitments and action language accurately. Return only the transcript text."
+        "companies, commitments and action language accurately."
     )
     timeout = httpx.Timeout(45.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         with path.open("rb") as fh:
-            files = {"file": (path.name, fh, mime_type)}
-            data = {"model": TRANSCRIBE_MODEL, "prompt": prompt, "response_format": "json"}
             response = await client.post(
                 f"{OPENAI_BASE}/audio/transcriptions",
                 headers=openai_headers(),
-                data=data,
-                files=files,
+                data={"model": TRANSCRIBE_MODEL, "prompt": prompt, "response_format": "json"},
+                files={"file": (path.name, fh, mime_type)},
             )
     if response.status_code >= 300:
         raise RuntimeError(f"Transcription failed {response.status_code}: {response.text[:500]}")
@@ -232,7 +247,7 @@ async def transcribe_file(path: Path, mime_type: str) -> str:
 
 
 def meeting_dir(meeting_id: str) -> Path:
-    safe = "".join(ch for ch in meeting_id if ch.isalnum() or ch in "-_" )[:128]
+    safe = "".join(ch for ch in meeting_id if ch.isalnum() or ch in "-_")[:128]
     if safe != meeting_id:
         raise HTTPException(status_code=400, detail="Invalid meeting id")
     path = DATA_DIR / "meetings" / safe / "chunks"
@@ -251,8 +266,10 @@ def mime_for(codec: str) -> tuple[str, str]:
 
 def claim_next_chunk() -> sqlite3.Row | None:
     db = db_connect()
+    began = False
     try:
         db.execute("BEGIN IMMEDIATE")
+        began = True
         row = db.execute(
             """
             SELECT * FROM chunks
@@ -272,18 +289,21 @@ def claim_next_chunk() -> sqlite3.Row | None:
         db.execute("COMMIT")
         return row
     except Exception:
-        db.execute("ROLLBACK")
+        if began:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
         raise
     finally:
         db.close()
 
 
 def set_chunk_success(meeting_id: str, sequence: int, text: str) -> None:
-    with db_connect() as db:
+    with db_session() as db:
         db.execute(
             """
-            UPDATE chunks
-            SET state='transcribed', transcript=?, last_error=NULL, updated_at_ms=?
+            UPDATE chunks SET state='transcribed', transcript=?, last_error=NULL, updated_at_ms=?
             WHERE meeting_id=? AND sequence=?
             """,
             (text, now_ms(), meeting_id, sequence),
@@ -293,46 +313,52 @@ def set_chunk_success(meeting_id: str, sequence: int, text: str) -> None:
 def set_chunk_failure(row: sqlite3.Row, error: str) -> None:
     retry = int(row["retry_count"]) + 1
     delay_seconds = min(300, 2 ** min(retry, 8))
-    next_retry = now_ms() + delay_seconds * 1000
     state = "uploaded" if retry < 8 else "failed"
-    with db_connect() as db:
+    with db_session() as db:
         db.execute(
             """
             UPDATE chunks
             SET state=?, retry_count=?, next_retry_at_ms=?, last_error=?, updated_at_ms=?
             WHERE meeting_id=? AND sequence=?
             """,
-            (state, retry, next_retry, error[:1000], now_ms(), row["meeting_id"], row["sequence"]),
+            (
+                state, retry, now_ms() + delay_seconds * 1000, error[:1000], now_ms(),
+                row["meeting_id"], row["sequence"],
+            ),
         )
 
 
 async def maybe_generate_rolling(meeting_id: str) -> None:
-    while True:
-        with db_connect() as db:
-            last = db.execute(
-                "SELECT MAX(window_end_ms) AS end_ms FROM rolling_summaries WHERE meeting_id=?",
-                (meeting_id,),
-            ).fetchone()["end_ms"]
-            window_start = int(last or 0)
-            max_end_row = db.execute(
-                "SELECT MAX(end_ms) AS end_ms FROM chunks WHERE meeting_id=? AND state='transcribed'",
-                (meeting_id,),
-            ).fetchone()
-            max_end = int(max_end_row["end_ms"] or 0)
-            if max_end - window_start < ROLLING_WINDOW_MS:
-                return
-            window_end = window_start + ROLLING_WINDOW_MS
-            rows = db.execute(
-                """
-                SELECT sequence, start_ms, end_ms, transcript FROM chunks
-                WHERE meeting_id=? AND state='transcribed' AND end_ms>? AND start_ms<?
-                ORDER BY sequence
-                """,
-                (meeting_id, window_start, window_end),
-            ).fetchall()
-        transcript = "\n".join(str(r["transcript"] or "") for r in rows if str(r["transcript"] or "").strip())
-        if transcript:
-            prompt = f"""
+    lock = rolling_locks.setdefault(meeting_id, asyncio.Lock())
+    async with lock:
+        while True:
+            with db_session() as db:
+                last = db.execute(
+                    "SELECT MAX(window_end_ms) AS end_ms FROM rolling_summaries WHERE meeting_id=?",
+                    (meeting_id,),
+                ).fetchone()["end_ms"]
+                window_start = int(last or 0)
+                max_end = int(
+                    db.execute(
+                        "SELECT MAX(end_ms) AS end_ms FROM chunks WHERE meeting_id=? AND state='transcribed'",
+                        (meeting_id,),
+                    ).fetchone()["end_ms"]
+                    or 0
+                )
+                if max_end - window_start < ROLLING_WINDOW_MS:
+                    return
+                window_end = window_start + ROLLING_WINDOW_MS
+                rows = db.execute(
+                    """
+                    SELECT transcript FROM chunks
+                    WHERE meeting_id=? AND state='transcribed' AND end_ms>? AND start_ms<?
+                    ORDER BY sequence
+                    """,
+                    (meeting_id, window_start, window_end),
+                ).fetchall()
+            transcript = "\n".join(str(r["transcript"] or "") for r in rows if str(r["transcript"] or "").strip())
+            if transcript:
+                prompt = f"""
 You are TANU's rolling meeting-memory engine. This is one approximately ten-minute block of a longer meeting.
 The speech can be English, Tamil, Tanglish, or code-switched.
 Extract only facts stated in this block. Never invent owners, deadlines, decisions, names or commitments.
@@ -341,56 +367,62 @@ Keep the summary concise. Put unresolved questions in openQuestions.
 TRANSCRIPT BLOCK:
 {transcript}
 """.strip()
-            data = await responses_json(prompt, "tanu_rolling_memory", ROLLING_SCHEMA)
-        else:
-            data = {"summary": "", "decisions": [], "actions": [], "openQuestions": [], "followUps": []}
-        with db_connect() as db:
-            db.execute(
-                """
-                INSERT OR REPLACE INTO rolling_summaries
-                (meeting_id, window_start_ms, window_end_ms, data_json, created_at_ms)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (meeting_id, window_start, window_end, json.dumps(data), now_ms()),
-            )
+                data = await responses_json(prompt, "tanu_rolling_memory", ROLLING_SCHEMA)
+            else:
+                data = {"summary": "", "decisions": [], "actions": [], "openQuestions": [], "followUps": []}
+            with db_session() as db:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO rolling_summaries
+                    (meeting_id, window_start_ms, window_end_ms, data_json, created_at_ms)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (meeting_id, window_start, window_end, json.dumps(data), now_ms()),
+                )
 
 
 async def build_final_mom(meeting_id: str) -> None:
-    with db_connect() as db:
+    with db_session() as db:
         meeting = db.execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
         if not meeting or meeting["final_mom_json"]:
             return
-        pending = db.execute(
-            "SELECT COUNT(*) AS n FROM chunks WHERE meeting_id=? AND state NOT IN ('transcribed','failed')",
-            (meeting_id,),
-        ).fetchone()["n"]
-        if pending:
+        expected = meeting["expected_chunks"]
+        total = int(db.execute("SELECT COUNT(*) AS n FROM chunks WHERE meeting_id=?", (meeting_id,)).fetchone()["n"])
+        if expected is None or total < int(expected):
             return
+        active = int(
+            db.execute(
+                "SELECT COUNT(*) AS n FROM chunks WHERE meeting_id=? AND state NOT IN ('transcribed','failed')",
+                (meeting_id,),
+            ).fetchone()["n"]
+        )
+        if active:
+            return
+        failed = int(db.execute("SELECT COUNT(*) AS n FROM chunks WHERE meeting_id=? AND state='failed'", (meeting_id,)).fetchone()["n"])
         summaries = db.execute(
-            "SELECT * FROM rolling_summaries WHERE meeting_id=? ORDER BY window_start_ms",
-            (meeting_id,),
+            "SELECT * FROM rolling_summaries WHERE meeting_id=? ORDER BY window_start_ms", (meeting_id,)
         ).fetchall()
         last_end = int(summaries[-1]["window_end_ms"]) if summaries else 0
         tail_rows = db.execute(
             """
-            SELECT transcript FROM chunks
-            WHERE meeting_id=? AND state='transcribed' AND end_ms>?
-            ORDER BY sequence
+            SELECT transcript FROM chunks WHERE meeting_id=? AND state='transcribed' AND end_ms>? ORDER BY sequence
             """,
             (meeting_id, last_end),
         ).fetchall()
+        all_rows = None if summaries else db.execute(
+            "SELECT transcript FROM chunks WHERE meeting_id=? AND state='transcribed' ORDER BY sequence", (meeting_id,)
+        ).fetchall()
 
-    memory_text = "\n".join(
-        f"BLOCK {i + 1}: {row['data_json']}" for i, row in enumerate(summaries)
-    )
-    tail = "\n".join(str(row["transcript"] or "") for row in tail_rows if str(row["transcript"] or "").strip())
-    if not summaries:
-        with db_connect() as db:
-            all_rows = db.execute(
-                "SELECT transcript FROM chunks WHERE meeting_id=? AND state='transcribed' ORDER BY sequence",
+    memory_text = "\n".join(f"BLOCK {i + 1}: {row['data_json']}" for i, row in enumerate(summaries))
+    source_rows = all_rows if all_rows is not None else tail_rows
+    tail = "\n".join(str(row["transcript"] or "") for row in source_rows if str(row["transcript"] or "").strip())
+    if not memory_text and not tail:
+        with db_session() as db:
+            db.execute(
+                "UPDATE meetings SET state='partial', final_error='No transcribed audio available' WHERE id=?",
                 (meeting_id,),
-            ).fetchall()
-        tail = "\n".join(str(row["transcript"] or "") for row in all_rows if str(row["transcript"] or "").strip())
+            )
+        return
 
     prompt = f"""
 You are TANU, a meeting-minutes assistant.
@@ -400,6 +432,7 @@ Create concise final minutes in clear English unless the meeting explicitly requ
 Never invent a decision, owner, deadline, name or commitment.
 Deduplicate repeated actions/decisions across rolling blocks.
 If owner or due date was not explicitly stated, use an empty string.
+There were {failed} permanently failed audio chunks; do not infer content that is missing.
 
 ROLLING MEETING MEMORY:
 {memory_text or '(none; use transcript below)'}
@@ -410,13 +443,14 @@ TRANSCRIPT AFTER LAST ROLLING BLOCK:
     try:
         data = await responses_json(prompt, "tanu_final_mom", MOM_SCHEMA)
         MomResponse.model_validate(data)
-        with db_connect() as db:
+        final_state = "partial_ready" if failed else "ready"
+        with db_session() as db:
             db.execute(
-                "UPDATE meetings SET final_mom_json=?, final_error=NULL, state='ready' WHERE id=?",
-                (json.dumps(data), meeting_id),
+                "UPDATE meetings SET final_mom_json=?, final_error=NULL, state=? WHERE id=?",
+                (json.dumps(data), final_state, meeting_id),
             )
     except Exception as exc:
-        with db_connect() as db:
+        with db_session() as db:
             db.execute("UPDATE meetings SET final_error=? WHERE id=?", (str(exc)[:1000], meeting_id))
 
 
@@ -430,25 +464,32 @@ async def transcription_worker(worker_id: int) -> None:
         try:
             text = await transcribe_file(Path(row["path"]), str(row["mime_type"]))
             set_chunk_success(str(row["meeting_id"]), int(row["sequence"]), text)
-            await maybe_generate_rolling(str(row["meeting_id"]))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             set_chunk_failure(row, str(exc))
+            continue
+        try:
+            await maybe_generate_rolling(str(row["meeting_id"]))
+        except Exception:
+            pass
 
 
 async def finalizer_worker() -> None:
     while True:
-        with db_connect() as db:
+        with db_session() as db:
             ids = [
                 str(r["id"])
                 for r in db.execute(
-                    "SELECT id FROM meetings WHERE state='finalizing' AND final_mom_json IS NULL"
+                    "SELECT id FROM meetings WHERE state IN ('finalizing','partial') AND final_mom_json IS NULL"
                 ).fetchall()
             ]
         for meeting_id in ids:
             try:
                 await maybe_generate_rolling(meeting_id)
+            except Exception:
+                pass
+            try:
                 await build_final_mom(meeting_id)
             except Exception:
                 pass
@@ -472,33 +513,23 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-app = FastAPI(title="TANU Core API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="TANU Core API", version="0.2.1", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "stt_workers": 0 if DISABLE_WORKERS else WORKER_COUNT,
-        "rolling_window_ms": ROLLING_WINDOW_MS,
-    }
+    return {"status": "ok", "stt_workers": 0 if DISABLE_WORKERS else WORKER_COUNT, "rolling_window_ms": ROLLING_WINDOW_MS}
 
 
 @app.post("/v1/meetings")
-async def create_meeting(
-    body: MeetingCreate,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
+async def create_meeting(body: MeetingCreate, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_auth(authorization)
-    with db_connect() as db:
+    with db_session() as db:
         existing = db.execute("SELECT * FROM meetings WHERE id=?", (body.id,)).fetchone()
         if existing:
             return {"id": body.id, "accepted": True, "existing": True}
         db.execute(
-            """
-            INSERT INTO meetings(id, title, started_at_ms, created_at_ms, state)
-            VALUES (?, ?, ?, ?, 'recording')
-            """,
+            "INSERT INTO meetings(id,title,started_at_ms,created_at_ms,state) VALUES (?,?,?,?, 'recording')",
             (body.id, body.title, body.started_at_ms, now_ms()),
         )
     return {"id": body.id, "accepted": True, "existing": False}
@@ -518,18 +549,26 @@ async def upload_chunk(
     require_auth(authorization)
     if sequence < 0 or x_tanu_end_ms <= x_tanu_start_ms:
         raise HTTPException(status_code=400, detail="Invalid chunk metadata")
-    with db_connect() as db:
-        meeting = db.execute("SELECT id FROM meetings WHERE id=?", (meeting_id,)).fetchone()
-        if not meeting:
+    with db_session() as db:
+        if not db.execute("SELECT id FROM meetings WHERE id=?", (meeting_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Meeting does not exist")
         existing = db.execute(
-            "SELECT sha256, state FROM chunks WHERE meeting_id=? AND sequence=?",
-            (meeting_id, sequence),
+            "SELECT sha256,state FROM chunks WHERE meeting_id=? AND sequence=?", (meeting_id, sequence)
         ).fetchone()
         if existing:
             if existing["sha256"] != x_tanu_sha256:
                 raise HTTPException(status_code=409, detail="Chunk sequence already exists with a different checksum")
-            return {"accepted": True, "sequence": sequence, "duplicate": True, "state": existing["state"]}
+            state = str(existing["state"])
+            if state == "failed":
+                db.execute(
+                    """
+                    UPDATE chunks SET state='uploaded', retry_count=0, next_retry_at_ms=0, last_error=NULL, updated_at_ms=?
+                    WHERE meeting_id=? AND sequence=?
+                    """,
+                    (now_ms(), meeting_id, sequence),
+                )
+                state = "uploaded"
+            return {"accepted": True, "sequence": sequence, "duplicate": True, "state": state}
 
     mime_type, extension = mime_for(x_tanu_codec)
     raw = await request.body()
@@ -546,13 +585,12 @@ async def upload_chunk(
     temp.write_bytes(raw)
     temp.replace(path)
     stamp = now_ms()
-    with db_connect() as db:
+    with db_session() as db:
         db.execute(
             """
             INSERT INTO chunks(
-                meeting_id, sequence, start_ms, end_ms, codec, mime_type, sha256, path,
-                size_bytes, state, created_at_ms, updated_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?)
+                meeting_id,sequence,start_ms,end_ms,codec,mime_type,sha256,path,size_bytes,state,created_at_ms,updated_at_ms
+            ) VALUES (?,?,?,?,?,?,?,?,?,'uploaded',?,?)
             """,
             (
                 meeting_id, sequence, x_tanu_start_ms, x_tanu_end_ms, x_tanu_codec.lower(), mime_type,
@@ -563,12 +601,9 @@ async def upload_chunk(
 
 
 @app.get("/v1/meetings/{meeting_id}/updates")
-async def meeting_updates(
-    meeting_id: str,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
+async def meeting_updates(meeting_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_auth(authorization)
-    with db_connect() as db:
+    with db_session() as db:
         meeting = db.execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
         if not meeting:
             raise HTTPException(status_code=404, detail="Meeting does not exist")
@@ -577,31 +612,28 @@ async def meeting_updates(
             (meeting_id,),
         ).fetchall()
         rolling = db.execute(
-            "SELECT * FROM rolling_summaries WHERE meeting_id=? ORDER BY window_start_ms",
-            (meeting_id,),
+            "SELECT * FROM rolling_summaries WHERE meeting_id=? ORDER BY window_start_ms", (meeting_id,)
         ).fetchall()
     transcribed = sum(1 for c in chunks if c["state"] == "transcribed")
-    pending = sum(1 for c in chunks if c["state"] not in ("transcribed", "failed"))
+    active = sum(1 for c in chunks if c["state"] not in ("transcribed", "failed"))
+    expected = meeting["expected_chunks"]
+    missing = max(0, int(expected) - len(chunks)) if expected is not None else 0
     return {
         "state": meeting["state"],
+        "expected_chunks": expected,
         "total_chunks": len(chunks),
-        "pending_chunks": pending,
+        "pending_chunks": active + missing,
         "transcribed_chunks": transcribed,
         "chunks": [
             {
-                "sequence": c["sequence"],
-                "start_ms": c["start_ms"],
-                "end_ms": c["end_ms"],
-                "state": c["state"],
-                "text": c["transcript"] or "",
-                "last_error": c["last_error"],
+                "sequence": c["sequence"], "start_ms": c["start_ms"], "end_ms": c["end_ms"],
+                "state": c["state"], "text": c["transcript"] or "", "last_error": c["last_error"],
             }
             for c in chunks
         ],
         "rolling_summaries": [
             {
-                "window_start_ms": r["window_start_ms"],
-                "window_end_ms": r["window_end_ms"],
+                "window_start_ms": r["window_start_ms"], "window_end_ms": r["window_end_ms"],
                 "data": json.loads(r["data_json"]),
             }
             for r in rolling
@@ -612,24 +644,24 @@ async def meeting_updates(
 @app.post("/v1/meetings/{meeting_id}/finalize", status_code=202)
 async def finalize_meeting(
     meeting_id: str,
+    body: FinalizeRequest,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_auth(authorization)
-    with db_connect() as db:
-        meeting = db.execute("SELECT id FROM meetings WHERE id=?", (meeting_id,)).fetchone()
-        if not meeting:
+    with db_session() as db:
+        if not db.execute("SELECT id FROM meetings WHERE id=?", (meeting_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Meeting does not exist")
-        db.execute("UPDATE meetings SET state='finalizing' WHERE id=?", (meeting_id,))
-    return {"accepted": True, "state": "finalizing"}
+        db.execute(
+            "UPDATE meetings SET state='finalizing', expected_chunks=? WHERE id=?",
+            (body.expected_chunks, meeting_id),
+        )
+    return {"accepted": True, "state": "finalizing", "expected_chunks": body.expected_chunks}
 
 
 @app.get("/v1/meetings/{meeting_id}/mom")
-async def get_mom(
-    meeting_id: str,
-    authorization: str | None = Header(default=None),
-) -> Response:
+async def get_mom(meeting_id: str, authorization: str | None = Header(default=None)) -> Response:
     require_auth(authorization)
-    with db_connect() as db:
+    with db_session() as db:
         meeting = db.execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting does not exist")

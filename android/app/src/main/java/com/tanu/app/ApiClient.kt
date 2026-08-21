@@ -43,8 +43,7 @@ class ApiClient(
             .header("X-TANU-END-MS", chunk.endMs.toString())
             .header("X-TANU-CODEC", chunk.codec)
             .put(file.asRequestBody(chunk.mimeType.toMediaType()))
-        val json = JSONObject(execute(request))
-        json.optBoolean("accepted", false)
+        JSONObject(execute(request)).optBoolean("accepted", false)
     }
 
     suspend fun fetchUpdates(meetingId: String): MeetingUpdate = withContext(Dispatchers.IO) {
@@ -84,8 +83,10 @@ class ApiClient(
         )
     }
 
-    suspend fun finalizeMeeting(meetingId: String) = withContext(Dispatchers.IO) {
-        execute(Request.Builder().url("$baseUrl/v1/meetings/$meetingId/finalize").post(ByteArray(0).toRequestBody(null)))
+    suspend fun finalizeMeeting(meetingId: String, expectedChunks: Int) = withContext(Dispatchers.IO) {
+        val body = JSONObject().put("expected_chunks", expectedChunks).toString()
+            .toRequestBody("application/json".toMediaType())
+        execute(Request.Builder().url("$baseUrl/v1/meetings/$meetingId/finalize").post(body))
     }
 
     suspend fun fetchMom(meetingId: String): Mom? = withContext(Dispatchers.IO) {
