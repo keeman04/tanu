@@ -11,8 +11,8 @@ object SpeechModelHolder {
     @Volatile var model: Model? = null
         private set
 
-    // The app must never be gated by speech-model availability. Audio recording is the
-    // source of truth and remains usable while the model is loading or if it fails.
+    // MAI's home screen and meeting setup must never depend on the speech engine.
+    // Audio is the source of truth; speech recognition is an optional enhancement.
     private val _ready = MutableStateFlow(true)
     val ready: StateFlow<Boolean> = _ready
 
@@ -24,11 +24,28 @@ object SpeechModelHolder {
         Thread(runnable, "mai-speech-model").apply { isDaemon = true }
     }
 
+    /**
+     * Launch-safe entry point used by the UI. Intentionally does not touch Vosk, JNA,
+     * native libraries, or the bundled model. This keeps a normal app cold start isolated
+     * from speech-engine compatibility problems on individual Android devices.
+     */
     fun ensure(context: Context) {
+        context.applicationContext
+        _ready.value = true
+    }
+
+    /**
+     * Called only after the user has explicitly started a meeting. Loading happens on a
+     * background thread and recording does not wait for it.
+     */
+    fun ensureForRecording(context: Context) {
+        loadModel(context.applicationContext)
+    }
+
+    private fun loadModel(appContext: Context) {
         if (model != null || loading) return
         loading = true
         _error.value = null
-        val appContext = context.applicationContext
 
         executor.execute {
             try {
