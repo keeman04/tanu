@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Antenna -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#0F0F0F"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:pathData="M54,24 L54,14" />
+    <path
+        android:fillColor="#0F0F0F"
+        android:pathData="M54,7.5 A6.5,6.5 0,1 1,53.99 7.5 Z" />
+
+    <!-- Headset ear pads -->
+    <path
+        android:fillColor="#0F0F0F"
+        android:pathData="M22,43 C17,43 14,47 14,52 L14,62 C14,67 17,71 22,71 L27,71 L27,43 Z" />
+    <path
+        android:fillColor="#0F0F0F"
+        android:pathData="M86,43 C91,43 94,47 94,52 L94,62 C94,67 91,71 86,71 L81,71 L81,43 Z" />
+
+    <!-- Speech / robot shell with tail -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:strokeColor="#0F0F0F"
+        android:strokeWidth="5.2"
+        android:strokeLineJoin="round"
+        android:pathData="M54,22 C35,22 23,34 23,54 C23,72 34,82 50,84 L35,96 L37,81 C29,75 25,66 25,54 C25,35 36,24 54,24 C72,24 84,35 84,54 C84,73 72,84 54,84 C52,84 51,84 49,84 L37,92 L39,79 C30,73 26,64 26,54 C26,36 37,27 54,27 C71,27 81,36 81,54 C81,71 71,80 54,80 C37,80 27,71 27,54 C27,36 38,27 54,27" />
+
+    <!-- Face -->
+    <path
+        android:fillColor="#0F0F0F"
+        android:pathData="M38,39 C34,39 31,42 31,46 L31,62 C31,68 35,72 41,72 L67,72 C73,72 77,68 77,62 L77,46 C77,42 74,39 70,39 Z" />
+
+    <!-- Smiling eyes -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:pathData="M39,55 C39,49 47,49 47,55" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:pathData="M61,55 C61,49 69,49 69,55" />
+</vector>
