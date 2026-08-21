@@ -3,9 +3,12 @@ package com.mai.app.ui
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
+/** Keep ordinary no-argument runCatching calls working inside the UI package. */
+internal inline fun <R> runCatching(block: () -> R): Result<R> = kotlin.runCatching(block)
+
 /**
- * Narrow overload used by the Actions screen's date parser. It accepts the formatter-shaped
- * lambda and tries the two persisted MAI date formats without changing any other runCatching use.
+ * Compatibility overload for the Actions screen's formatter-shaped date lambda.
+ * It accepts both date formats MAI persists today.
  */
 internal fun runCatching(block: (DateTimeFormatter) -> LocalDate): Result<LocalDate> {
     var last: Throwable? = null
