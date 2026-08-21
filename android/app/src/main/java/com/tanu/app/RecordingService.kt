@@ -95,7 +95,7 @@ class RecordingService : Service() {
             maxOf(minBuffer, FRAME_BYTES * 4)
         )
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            broadcastFailure(meetingId, "TANU could not initialize the microphone"); recorder.release(); finishService(); return
+            broadcastFailure(meetingId, "Could not initialize the microphone"); recorder.release(); finishService(); return
         }
 
         val dbMax = dao.maxSequence(meetingId)
@@ -265,11 +265,11 @@ class RecordingService : Service() {
 
     private fun createNotificationChannel() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "TANU recording", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL_ID, "Meeting Assistant and Intelligence recording", NotificationManager.IMPORTANCE_LOW)
         )
     }
     private fun notification(text: String): Notification = Notification.Builder(this, CHANNEL_ID)
-        .setContentTitle("TANU meeting").setContentText(text).setSmallIcon(android.R.drawable.ic_btn_speak_now).setOngoing(recording).build()
+        .setContentTitle("Meeting Assistant and Intelligence").setContentText(text).setSmallIcon(android.R.drawable.ic_btn_speak_now).setOngoing(recording).build()
     private fun updateNotification(text: String) { getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text)) }
 
     companion object {
