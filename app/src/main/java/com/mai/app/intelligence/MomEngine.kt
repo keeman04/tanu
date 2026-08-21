@@ -2,6 +2,7 @@ package com.mai.app.intelligence
 
 import com.mai.app.data.ActionRecord
 import com.mai.app.data.Participant
+import java.text.Normalizer
 import java.time.DayOfWeek
 import java.time.Instant
 import java.time.ZoneId
@@ -74,16 +75,24 @@ object MomEngine {
     }
 
     private fun similarity(a: String, b: String): Double {
+        val normalizedA = normalizedText(a)
+        val normalizedB = normalizedText(b)
+        if (normalizedA.isNotBlank() && normalizedA == normalizedB) return 1.0
+
         val aa = tokens(a)
         val bb = tokens(b)
         if (aa.isEmpty() || bb.isEmpty()) return 0.0
         return aa.intersect(bb).size.toDouble() / max(1.0, aa.union(bb).size.toDouble())
     }
 
-    private fun tokens(s: String): Set<String> = s.lowercase()
-        .replace(Regex("[^\\p{L}\\p{N} ]"), " ")
+    private fun normalizedText(s: String): String = Normalizer.normalize(s.lowercase(), Normalizer.Form.NFC)
+        .replace(Regex("[^\\p{L}\\p{M}\\p{N} ]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    private fun tokens(s: String): Set<String> = normalizedText(s)
         .split(Regex("\\s+"))
-        .filter { it.length > 2 && it !in setOf("the", "and", "for", "with", "that", "this") }
+        .filter { it.length > 1 && it !in setOf("the", "and", "for", "with", "that", "this") }
         .toSet()
 
     private fun resolveDue(text: String, meetingStart: Long): String? {
