@@ -48,11 +48,47 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Android 35 cold-start test
+
+      - name: Android 35 launcher cold-start test
+        id: launcher-smoke
+        continue-on-error: true
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           arch: x86_64
           profile: pixel_2
           disable-animations: true
-          script: gradle --no-daemon connectedDebugAndroidTest
+          script: |
+            set +e
+            STATUS=0
+            gradle --no-daemon assembleDebug || STATUS=1
+            adb install -r app/build/outputs/apk/debug/app-debug.apk || STATUS=1
+            adb logcat -c || true
+            adb shell am force-stop com.mai.app || true
+            adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.mai.app/.MainActivity || STATUS=1
+            sleep 15
+            PID="$(adb shell pidof com.mai.app 2>/dev/null | tr -d '\r')"
+            adb logcat -d -v threadtime > android-logcat.txt || true
+            adb shell dumpsys activity activities > android-activities.txt || true
+            if [ -z "$PID" ]; then
+              echo "MAI process is not alive after cold start"
+              STATUS=1
+            else
+              echo "MAI process survived cold start with PID $PID"
+            fi
+            exit $STATUS
+
+      - name: Upload cold-start diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAI-cold-start-diagnostics
+          path: |
+            android-logcat.txt
+            android-activities.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Enforce cold-start result
+        if: steps.launcher-smoke.outcome == 'failure'
+        run: exit 1
