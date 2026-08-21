@@ -16,13 +16,20 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import com.mai.app.MainActivity
 import com.mai.app.R
 import com.mai.app.data.MaiDb
+import com.mai.app.intelligence.AiEnhanceWorker
 import com.mai.app.intelligence.MomEngine
 import org.json.JSONObject
 import org.vosk.Recognizer
 import java.io.File
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
 
@@ -74,8 +81,6 @@ class RecordingService : Service() {
         running.set(true)
         RecordingBus.update { RecordingSnapshot(active = true, meetingId = id, startedAt = startedAt, status = "recording") }
 
-        // Audio starts first. Speech recognition warms up independently and can fail without
-        // ever blocking or invalidating the source recording.
         SpeechModelHolder.ensureForRecording(this)
         thread = Thread({ captureLoop(id) }, "mai-audio").apply { start() }
     }
@@ -109,8 +114,6 @@ class RecordingService : Service() {
             while (running.get()) {
                 val read = audio.read(buffer, 0, buffer.size)
                 if (read <= 0) continue
-
-                // Source audio is persisted before any recognition or UI work.
                 sink.writePcm(buffer, read)
                 audioSafe = audioSafe || output.length() > 512
 
@@ -198,6 +201,7 @@ class RecordingService : Service() {
                 audioPath = path,
                 audioExpiresAt = expiry
             )
+            if (path != null) enqueueAiEnhancement(id)
         }
         RecordingBus.update {
             it.copy(
@@ -211,6 +215,15 @@ class RecordingService : Service() {
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun enqueueAiEnhancement(id: String) {
+        val request = OneTimeWorkRequestBuilder<AiEnhanceWorker>()
+            .setInputData(AiEnhanceWorker.input(id))
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setBackoffCriteria(androidx.work.BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .build()
+        WorkManager.getInstance(this).enqueueUniqueWork("mai-ai-$id", ExistingWorkPolicy.REPLACE, request)
     }
 
     private fun stopRecording() {
