@@ -13,7 +13,6 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
-import android.os.SystemClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -22,33 +21,32 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
-import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.util.Collections
+import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.sqrt
 
 class RecordingService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private lateinit var store: MeetingStore
-    private val api = ApiClient()
-    private val semaphore = Semaphore(3)
-    private val transcriptionJobs = Collections.synchronizedList(mutableListOf<Job>())
-    private val queued = AtomicInteger(0)
+    private lateinit var db: TanuDatabase
+    private lateinit var dao: TanuDao
+    private val encoder = SpeechChunkEncoder()
+    private val encodeMutex = Mutex()
+    private val encodingJobs = mutableListOf<Job>()
+    private val pendingEncodes = AtomicInteger(0)
 
     @Volatile private var stopRequested = false
-    @Volatile private var isRecording = false
+    @Volatile private var recording = false
     private var activeMeetingId: String? = null
-    private var activeTitle: String = "Meeting"
+    private var activeTitle = "Meeting"
+    private var meetingStartElapsed = 0L
 
     override fun onCreate() {
         super.onCreate()
-        store = MeetingStore(this)
+        db = TanuDatabase.get(this)
+        dao = db.dao()
         createNotificationChannel()
     }
 
@@ -57,24 +55,22 @@ class RecordingService : Service() {
             ACTION_START -> {
                 val meetingId = intent.getStringExtra(EXTRA_MEETING_ID) ?: return START_NOT_STICKY
                 val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "Meeting" }
-                if (!isRecording) {
-                    startForeground(NOTIFICATION_ID, notification("Starting recording"))
+                if (!recording) {
+                    startForeground(NOTIFICATION_ID, notification("Starting microphone"))
                     scope.launch { runRecording(meetingId, title) }
                 }
             }
             ACTION_STOP -> {
                 stopRequested = true
-                updateNotification("Finishing meeting")
-                broadcast("finishing", "Finishing the last audio chunk…")
+                broadcast("finishing", "Closing the final audio chunk…")
             }
             ACTION_RETRY -> {
-                val meetingId = intent.getStringExtra(EXTRA_MEETING_ID) ?: return START_NOT_STICKY
-                val title = store.title(meetingId)
-                startForeground(NOTIFICATION_ID, notification("Retrying saved audio"))
-                scope.launch { retrySavedAudio(meetingId, title) }
+                PipelineRecovery.schedule(this)
+                activeMeetingId?.let { SyncMeetingWorker.enqueue(this, it) }
+                broadcast("retrying", "Retrying saved audio and transcript sync")
             }
         }
-        return START_NOT_STICKY
+        return START_REDELIVER_INTENT
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -82,189 +78,219 @@ class RecordingService : Service() {
     @SuppressLint("MissingPermission")
     private suspend fun runRecording(meetingId: String, title: String) {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            broadcast("failed", "Microphone permission is required.")
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return
+            broadcastFailure(meetingId, "Microphone permission is required")
+            finishService(); return
         }
 
         activeMeetingId = meetingId
         activeTitle = title
         stopRequested = false
-        isRecording = true
-        transcriptionJobs.clear()
-        queued.set(0)
-        store.initializeMeeting(meetingId, title)
+        recording = true
+        meetingStartElapsed = android.os.SystemClock.elapsedRealtime()
+        val now = System.currentTimeMillis()
+        val existing = dao.meeting(meetingId)
+        dao.upsertMeeting(existing ?: MeetingEntity(meetingId, title, now, startedAtMs = now))
+        scope.launch { runServerSyncLoop(meetingId) }
 
-        val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
-        val bufferSize = max(minBuffer, 4096)
+        val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val recorder = AudioRecord(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             SAMPLE_RATE,
-            CHANNEL,
-            ENCODING,
-            bufferSize
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(minBuffer, FRAME_BYTES * 4)
         )
-
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            broadcast("failed", "TANU could not initialize the microphone recorder.")
-            recorder.release()
-            finishService()
-            return
+            broadcastFailure(meetingId, "TANU could not initialize the microphone")
+            recorder.release(); finishService(); return
         }
 
-        val readBuffer = ByteArray(bufferSize)
-        var current = ByteArrayOutputStream(BYTES_PER_CHUNK)
-        var chunkIndex = 0
+        var sequence = dao.maxSequence(meetingId) + 1
+        var chunkStartMs = elapsedMeetingMs()
+        var pcmFile = PipelineFiles.tempPcm(this, meetingId, sequence)
+        var output = FileOutputStream(pcmFile)
+        var bytesInChunk = 0L
+        var silenceMs = 0L
+        val frame = ByteArray(FRAME_BYTES)
 
         try {
             recorder.startRecording()
-            broadcast("recording", "Recording • transcript is processed continuously")
+            broadcast("recording", "Audio safe • Opus chunks upload continuously")
             while (!stopRequested && scope.isActive) {
-                val count = recorder.read(readBuffer, 0, readBuffer.size)
-                if (count <= 0) continue
-                var offset = 0
-                while (offset < count) {
-                    val room = BYTES_PER_CHUNK - current.size()
-                    val amount = min(room, count - offset)
-                    current.write(readBuffer, offset, amount)
-                    offset += amount
-                    if (current.size() >= BYTES_PER_CHUNK) {
-                        queueChunk(meetingId, chunkIndex++, current.toByteArray())
-                        current = ByteArrayOutputStream(BYTES_PER_CHUNK)
-                    }
+                var collected = 0
+                while (collected < frame.size && !stopRequested) {
+                    val read = recorder.read(frame, collected, frame.size - collected)
+                    if (read > 0) collected += read
+                }
+                if (collected <= 0) continue
+                output.write(frame, 0, collected)
+                bytesInChunk += collected
+
+                val frameDurationMs = (collected / 2L) * 1000L / SAMPLE_RATE
+                silenceMs = if (isSilent(frame, collected)) silenceMs + frameDurationMs else 0L
+                val chunkDurationMs = bytesInChunk * 1000L / (SAMPLE_RATE * 2L)
+                val cutOnSilence = chunkDurationMs >= TARGET_CHUNK_MS && silenceMs >= SILENCE_TO_CUT_MS
+                val hardCut = chunkDurationMs >= MAX_CHUNK_MS
+                if (cutOnSilence || hardCut) {
+                    output.flush(); output.close()
+                    val endMs = chunkStartMs + chunkDurationMs
+                    queueEncoding(meetingId, sequence, pcmFile, chunkStartMs, endMs)
+                    sequence++
+                    chunkStartMs = endMs
+                    pcmFile = PipelineFiles.tempPcm(this, meetingId, sequence)
+                    output = FileOutputStream(pcmFile)
+                    bytesInChunk = 0L
+                    silenceMs = 0L
                 }
             }
-            if (current.size() > 0) queueChunk(meetingId, chunkIndex, current.toByteArray())
         } catch (t: Throwable) {
-            broadcast("failed", "Recording error: ${t.message ?: "unknown error"}")
+            broadcast("partial", "Recording error; completed chunks are safe: ${t.message ?: "unknown"}")
         } finally {
+            runCatching { output.flush() }
+            runCatching { output.close() }
             runCatching { recorder.stop() }
             recorder.release()
-            isRecording = false
+            recording = false
         }
 
-        completeMeeting(meetingId, title)
-        finishService()
-    }
-
-    private fun queueChunk(meetingId: String, index: Int, pcm: ByteArray) {
-        val file = store.chunkFile(meetingId, index)
-        file.writeBytes(wavBytes(pcm))
-        queued.incrementAndGet()
-        broadcast(
-            if (isRecording) "recording" else "transcribing",
-            "Saved chunk ${index + 1} • ${queued.get()} waiting/processing"
-        )
-        val job = scope.launch {
-            semaphore.withPermit {
-                try {
-                    val text = api.transcribeChunk(meetingId, index, file)
-                    if (text.isNotBlank()) store.saveTranscriptSegment(meetingId, index, text)
-                    broadcast(
-                        if (isRecording) "recording" else "transcribing",
-                        "Transcript updated • ${max(0, queued.get() - 1)} waiting/processing"
-                    )
-                } catch (t: Throwable) {
-                    broadcast(
-                        if (isRecording) "recording" else "partial",
-                        "Chunk ${index + 1} kept for retry: ${t.message ?: "transcription failed"}"
-                    )
-                } finally {
-                    queued.decrementAndGet()
-                }
-            }
-        }
-        transcriptionJobs.add(job)
-    }
-
-    private suspend fun completeMeeting(meetingId: String, title: String) {
-        broadcast("transcribing", "Finishing remaining transcript chunks…")
-        val allDone = waitForJobsHardDeadline(FINALIZE_DEADLINE_MS)
-        if (!allDone) {
-            transcriptionJobs.filter { it.isActive }.forEach { it.cancel() }
-            broadcast("partial", "Finalization deadline reached. Saved audio can be retried.")
-        }
-        val transcript = store.orderedTranscript(meetingId)
-        if (transcript.isBlank()) {
-            broadcast("failed", "No transcript yet. Audio is safely stored; tap Retry Processing.")
-            return
-        }
-
-        broadcast("mom", "Generating structured MOM…")
-        val mom = try {
-            api.generateMom(title, transcript)
-        } catch (_: Throwable) {
-            LocalMomFallback.generate(transcript)
-        }
-        store.saveMom(meetingId, mom)
-        val detail = if (mom.source == "cloud") {
-            "MOM ready"
+        if (pcmFile.exists() && pcmFile.length() > 0) {
+            val durationMs = pcmFile.length() * 1000L / (SAMPLE_RATE * 2L)
+            queueEncoding(meetingId, sequence, pcmFile, chunkStartMs, chunkStartMs + durationMs)
         } else {
-            "MOM ready with local fallback • retry later for structured cloud MOM"
+            pcmFile.delete()
         }
-        broadcast("ready", detail)
-    }
 
-    private suspend fun retrySavedAudio(meetingId: String, title: String) {
-        if (isRecording) return
-        transcriptionJobs.clear()
-        queued.set(0)
-        activeMeetingId = meetingId
-        activeTitle = title
-        val pending = store.missingChunkFiles(meetingId)
-        if (pending.isEmpty()) {
-            completeMeeting(meetingId, title)
-            finishService()
-            return
-        }
-        broadcast("transcribing", "Retrying ${pending.size} saved chunks…")
-        pending.forEach { file ->
-            val index = store.chunkIndex(file)
-            queued.incrementAndGet()
-            val job = scope.launch {
-                semaphore.withPermit {
-                    try {
-                        val text = api.transcribeChunk(meetingId, index, file)
-                        if (text.isNotBlank()) store.saveTranscriptSegment(meetingId, index, text)
-                    } catch (t: Throwable) {
-                        broadcast("partial", "Retry failed for chunk ${index + 1}: ${t.message ?: "error"}")
-                    } finally {
-                        queued.decrementAndGet()
-                    }
-                }
-            }
-            transcriptionJobs.add(job)
-        }
-        completeMeeting(meetingId, title)
+        broadcast("encoding", "Securing final compressed chunks…")
+        waitForEncodes()
+        dao.updateMeetingState(meetingId, "finalizing", System.currentTimeMillis())
+        runCatching { ApiClient().ensureMeeting(dao.meeting(meetingId)!!) }
+        runCatching { ApiClient().finalizeMeeting(meetingId) }
+        SyncMeetingWorker.enqueue(this, meetingId, 1)
+        broadcast("finalizing", "Audio secured • transcript and MOM are finishing")
+        waitForFinalMom(meetingId)
         finishService()
     }
 
-    private suspend fun waitForJobsHardDeadline(timeoutMs: Long): Boolean {
-        val deadline = SystemClock.elapsedRealtime() + timeoutMs
-        while (SystemClock.elapsedRealtime() < deadline) {
-            val snapshot = synchronized(transcriptionJobs) { transcriptionJobs.toList() }
-            if (snapshot.all { it.isCompleted }) return true
-            delay(250)
+    private fun queueEncoding(meetingId: String, sequence: Int, pcmFile: File, startMs: Long, endMs: Long) {
+        pendingEncodes.incrementAndGet()
+        val job = scope.launch {
+            try {
+                val encoded = encodeMutex.withLock {
+                    encoder.encode(pcmFile, PipelineFiles.encodedBase(this@RecordingService, meetingId, sequence))
+                }
+                val chunk = AudioChunkEntity(
+                    meetingId = meetingId,
+                    sequence = sequence,
+                    localPath = encoded.file.absolutePath,
+                    startMs = startMs,
+                    endMs = endMs,
+                    durationMs = endMs - startMs,
+                    sizeBytes = encoded.file.length(),
+                    sha256 = PipelineFiles.sha256(encoded.file),
+                    codec = encoded.codec,
+                    mimeType = encoded.mimeType,
+                    state = ChunkState.QUEUED
+                )
+                dao.upsertChunk(chunk)
+                pcmFile.delete()
+                ChunkUploadWorker.enqueue(this@RecordingService, meetingId, sequence)
+                broadcast("recording", "Audio safe • ${pendingEncodes.get() - 1} chunk(s) encoding")
+            } catch (t: Throwable) {
+                broadcast("partial", "A chunk stayed as PCM for recovery: ${t.message ?: "encode failed"}")
+            } finally {
+                pendingEncodes.decrementAndGet()
+            }
         }
-        return synchronized(transcriptionJobs) { transcriptionJobs.all { it.isCompleted } }
+        synchronized(encodingJobs) { encodingJobs += job }
     }
+
+    private suspend fun waitForEncodes() {
+        val deadline = android.os.SystemClock.elapsedRealtime() + 45_000L
+        while (pendingEncodes.get() > 0 && android.os.SystemClock.elapsedRealtime() < deadline) delay(200)
+    }
+
+    private suspend fun runServerSyncLoop(meetingId: String) {
+        while (recording && scope.isActive) {
+            SyncMeetingWorker.enqueue(this@RecordingService, meetingId)
+            delay(10_000)
+        }
+    }
+
+    private suspend fun waitForFinalMom(meetingId: String) {
+        val deadline = android.os.SystemClock.elapsedRealtime() + FINALIZE_DEADLINE_MS
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            val meeting = dao.meeting(meetingId)
+            if (!meeting?.finalMomJson.isNullOrBlank()) {
+                broadcast("ready", "MOM ready")
+                return
+            }
+            runCatching {
+                val update = ApiClient().fetchUpdates(meetingId)
+                persistUpdate(meetingId, update)
+                val mom = ApiClient().fetchMom(meetingId)
+                if (mom != null) {
+                    dao.saveFinalMom(meetingId, mom.toJson(), "cloud")
+                    broadcast("ready", "MOM ready")
+                    return
+                }
+            }
+            delay(3_000)
+        }
+        broadcast("partial", "Audio is safe. Processing continues with retry/recovery.")
+    }
+
+    private suspend fun persistUpdate(meetingId: String, update: MeetingUpdate) {
+        update.chunks.forEach { server ->
+            if (!server.text.isNullOrBlank()) {
+                dao.upsertTranscript(TranscriptSegmentEntity(meetingId, server.sequence, server.startMs, server.endMs, server.text))
+                dao.chunk(meetingId, server.sequence)?.let {
+                    dao.updateChunk(it.copy(state = ChunkState.TRANSCRIBED, transcribedAtMs = System.currentTimeMillis()))
+                }
+            }
+        }
+        dao.clearRollingSummaries(meetingId)
+        update.rollingSummaries.forEach { dao.upsertRollingSummary(it) }
+    }
+
+    private fun isSilent(bytes: ByteArray, count: Int): Boolean {
+        var sumSquares = 0.0
+        var samples = 0
+        var i = 0
+        while (i + 1 < count) {
+            val sample = ((bytes[i + 1].toInt() shl 8) or (bytes[i].toInt() and 0xff)).toShort().toInt()
+            sumSquares += sample.toDouble() * sample.toDouble()
+            samples++
+            i += 2
+        }
+        if (samples == 0) return true
+        val rms = sqrt(sumSquares / samples) / 32768.0
+        return rms < SILENCE_RMS_THRESHOLD
+    }
+
+    private fun elapsedMeetingMs(): Long = android.os.SystemClock.elapsedRealtime() - meetingStartElapsed
 
     private fun broadcast(state: String, message: String) {
-        val meetingId = activeMeetingId ?: return
-        sendBroadcast(
-            Intent(ACTION_UPDATE)
-                .setPackage(packageName)
-                .putExtra(EXTRA_MEETING_ID, meetingId)
+        val id = activeMeetingId ?: return
+        scope.launch {
+            val pending = runCatching { dao.pendingUploadCount(id) }.getOrDefault(0)
+            val storage = runCatching { dao.localAudioBytes(id) }.getOrDefault(0L)
+            sendBroadcast(Intent(ACTION_UPDATE).setPackage(packageName)
+                .putExtra(EXTRA_MEETING_ID, id)
                 .putExtra(EXTRA_STATE, state)
                 .putExtra(EXTRA_MESSAGE, message)
-                .putExtra(EXTRA_QUEUED, queued.get())
-        )
-        updateNotification(message)
+                .putExtra(EXTRA_PENDING, pending)
+                .putExtra(EXTRA_STORAGE_BYTES, storage))
+            updateNotification(message)
+        }
+    }
+
+    private fun broadcastFailure(meetingId: String, message: String) {
+        activeMeetingId = meetingId
+        broadcast("failed", message)
     }
 
     private fun finishService() {
-        activeMeetingId = null
+        recording = false
         stopRequested = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -276,61 +302,21 @@ class RecordingService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "TANU recording", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "TANU recording", NotificationManager.IMPORTANCE_LOW))
     }
 
-    private fun notification(text: String): Notification {
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            Notification.Builder(this)
-        }
-        return builder
+    private fun notification(text: String): Notification =
+        Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("TANU meeting")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setOngoing(isRecording)
+            .setOngoing(recording)
             .build()
-    }
 
     private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, notification(text))
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
     }
-
-    private fun wavBytes(pcm: ByteArray): ByteArray {
-        val out = ByteArrayOutputStream(44 + pcm.size)
-        out.write("RIFF".toByteArray())
-        out.write(leInt(36 + pcm.size))
-        out.write("WAVE".toByteArray())
-        out.write("fmt ".toByteArray())
-        out.write(leInt(16))
-        out.write(leShort(1))
-        out.write(leShort(1))
-        out.write(leInt(SAMPLE_RATE))
-        out.write(leInt(SAMPLE_RATE * 2))
-        out.write(leShort(2))
-        out.write(leShort(16))
-        out.write("data".toByteArray())
-        out.write(leInt(pcm.size))
-        out.write(pcm)
-        return out.toByteArray()
-    }
-
-    private fun leInt(value: Int): ByteArray = ByteBuffer.allocate(4)
-        .order(ByteOrder.LITTLE_ENDIAN)
-        .putInt(value)
-        .array()
-
-    private fun leShort(value: Int): ByteArray = ByteBuffer.allocate(2)
-        .order(ByteOrder.LITTLE_ENDIAN)
-        .putShort(value.toShort())
-        .array()
 
     companion object {
         const val ACTION_START = "com.tanu.app.START"
@@ -341,13 +327,16 @@ class RecordingService : Service() {
         const val EXTRA_TITLE = "title"
         const val EXTRA_STATE = "state"
         const val EXTRA_MESSAGE = "message"
-        const val EXTRA_QUEUED = "queued"
+        const val EXTRA_PENDING = "pending"
+        const val EXTRA_STORAGE_BYTES = "storage_bytes"
 
         private const val SAMPLE_RATE = 16_000
-        private const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
-        private const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
-        private const val CHUNK_SECONDS = 20
-        private const val BYTES_PER_CHUNK = SAMPLE_RATE * 2 * CHUNK_SECONDS
+        private const val FRAME_MS = 20
+        private const val FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS / 1000
+        private const val TARGET_CHUNK_MS = 15_000L
+        private const val MAX_CHUNK_MS = 20_000L
+        private const val SILENCE_TO_CUT_MS = 300L
+        private const val SILENCE_RMS_THRESHOLD = 0.012
         private const val FINALIZE_DEADLINE_MS = 90_000L
         private const val CHANNEL_ID = "tanu_recording"
         private const val NOTIFICATION_ID = 1042

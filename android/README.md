@@ -1,52 +1,39 @@
-# TANU Android — Core Pipeline Phase 1
+# TANU Android Phase 1
 
-This branch introduces the first clean Android implementation of TANU instead of patching the iOS pipeline.
+Android 10+ (API 29+) long-meeting meeting assistant.
 
-## What works in this phase
+## What is implemented
 
-- Foreground microphone recording for user-started in-person meetings.
-- 16 kHz mono PCM audio stored as recoverable WAV chunks.
-- 20-second chunks so transcription starts during the meeting.
-- Up to three chunk transcriptions in parallel instead of a serial queue.
-- Transcript segments persisted by chunk index so parallel completion does not scramble meeting order.
-- 90-second hard finalization deadline; unfinished audio remains on device for Retry Processing.
-- Structured cloud MOM through the TANU backend.
-- Local emergency MOM fallback if the cloud MOM request fails.
-- Android system share sheet for WhatsApp/email/other installed apps.
+- Foreground microphone recording initiated by the user.
+- Continuous 16 kHz mono AudioRecord capture.
+- Silence-aware 15–20 second chunk boundaries without stopping the microphone.
+- Native Opus/Ogg ~24 kbps using MediaCodec + MediaMuxer; AAC/M4A fallback if the device has no Opus encoder.
+- Local-first audio safety: every active chunk is written to a PCM temp file before compression.
+- Room database tracks meetings, audio chunks, transcript segments, rolling summaries and final MOM.
+- WorkManager handles network-aware resumable chunk uploads with exponential backoff.
+- SHA-256/idempotent chunk upload metadata.
+- Server async transcription; upload ACK is not blocked by STT.
+- Transcript sync every ~10 seconds while recording.
+- Rolling AI meeting memory approximately every 10 minutes.
+- Final MOM built from rolling memory plus remaining transcript tail.
+- Retry/recovery after connection loss or app process restart.
+- Android share sheet for WhatsApp/email/etc.
 
-## Deliberately NOT in Phase 1
+## Audio size
 
-- Automatic WhatsApp/cellular call capture.
-- Floating overlay controls.
-- Speaker diarization.
-- CRM/calendar integrations.
-- Automatic sending to participants.
+Opus target is 24 kbps, approximately 10.8 MB/hour of speech audio before container overhead. A 4-hour meeting is roughly 43 MB.
 
-Those features come after the core 5/15/30/60-minute meeting pipeline is proven reliable.
+## Configure
 
-## Build
+In `~/.gradle/gradle.properties` or CI properties:
 
-Open the `android/` directory in Android Studio. The project targets Android API 35 and requires Java 17.
-
-For emulator + local backend:
-
-```bash
-./gradlew :app:assembleDebug \
-  -PTANU_API_BASE_URL=http://10.0.2.2:8000 \
-  -PTANU_API_TOKEN=choose-a-random-dev-token
+```
+TANU_API_BASE_URL=https://your-api.example.com
+TANU_API_TOKEN=your-shared-development-token
 ```
 
-The debug manifest allows cleartext traffic only for local development. Release builds should use HTTPS.
+Debug builds can use `http://10.0.2.2:8000` for a local emulator backend. Release builds keep cleartext traffic disabled.
 
-## Acceptance test
+## Phase 1 boundary
 
-1. Run the backend.
-2. Install the debug APK on a real Android phone when testing microphone behavior.
-3. Grant microphone and notification permissions.
-4. Record 5 minutes containing English, Tamil and Tanglish.
-5. Confirm transcript text appears during the meeting.
-6. Press Stop and confirm the app finishes remaining chunks, then creates a MOM.
-7. Kill network access during a test and confirm saved audio remains available for Retry Processing.
-8. Share the resulting MOM via the Android share sheet.
-
-Do not delete source audio until the transcript and MOM are verified during the MVP test period.
+This app records the Android device microphone. It does not promise direct access to protected WhatsApp, cellular or other app call audio.

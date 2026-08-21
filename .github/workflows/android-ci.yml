@@ -9,27 +9,43 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-java@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Unit tests
+
+      - name: Android unit tests
         working-directory: android
         run: gradle :app:testDebugUnitTest
+
       - name: Build debug APK
         working-directory: android
         run: gradle :app:assembleDebug
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: TANU-Android-Core-Pipeline
+          name: TANU-Android-Phase1-Long-Meeting
           path: android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Backend contract tests
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pytest -q
