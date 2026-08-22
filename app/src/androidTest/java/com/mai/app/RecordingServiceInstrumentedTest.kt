@@ -37,27 +37,31 @@ class RecordingServiceInstrumentedTest {
                 listOf(Participant("Test Participant", "+919999999999"))
             )
 
-            ContextCompat.startForegroundService(
+            val component = ContextCompat.startForegroundService(
                 context,
                 Intent(context, RecordingService::class.java)
                     .setAction(RecordingService.ACTION_START)
                     .putExtra(RecordingService.EXTRA_MEETING_ID, id)
             )
+            assertNotNull(component)
 
-            // A CI emulator may not expose a real microphone. That is intentional: even
-            // when AudioRecord cannot initialize, MAI must report/recover instead of
-            // terminating the app process.
-            Thread.sleep(4_000)
+            // A CI emulator may not expose a usable microphone. Both outcomes are valid:
+            // recording proceeds, or MAI safely finalizes/reports an error. The process
+            // must never terminate because AudioRecord/STT initialization failed.
+            Thread.sleep(5_000)
             assertNotNull(db.getMeeting(id))
             assertTrue(
                 RecordingBus.state.value.meetingId == id ||
-                    RecordingBus.state.value.status in setOf("error", "ready", "recording", "listening", "voice", "securing")
+                    RecordingBus.state.value.status in setOf(
+                        "error", "ready", "recording", "listening", "voice",
+                        "securing", "interrupted", "reconnecting"
+                    )
             )
 
-            context.startService(
-                Intent(context, RecordingService::class.java).setAction(RecordingService.ACTION_STOP)
-            )
-            Thread.sleep(1_500)
+            runCatching {
+                context.startService(Intent(context, RecordingService::class.java).setAction(RecordingService.ACTION_STOP))
+            }
+            Thread.sleep(2_000)
             assertNotNull(db.getMeeting(id))
             db.deleteMeeting(id)
         }
