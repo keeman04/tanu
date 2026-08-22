@@ -24,13 +24,33 @@ class AiEnhanceWorker(appContext: Context, params: WorkerParameters) : Coroutine
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        val backend = BuildConfig.MAI_BACKEND_URL.trim().trimEnd('/')
-        if (backend.isBlank()) return@withContext Result.success()
         val id = inputData.getString(KEY_MEETING_ID) ?: return@withContext Result.failure()
         val db = MaiDb(applicationContext)
         val meeting = db.getMeeting(id) ?: return@withContext Result.success()
+        val backend = BuildConfig.MAI_BACKEND_URL.trim().trimEnd('/')
+
+        fun markUnavailable(message: String) {
+            db.replaceIntelligence(
+                id = meeting.id,
+                transcript = "",
+                summary = message,
+                decisions = emptyList(),
+                actions = emptyList()
+            )
+        }
+
+        if (backend.isBlank()) {
+            markUnavailable(
+                "Audio saved safely. Accurate multilingual transcription is not connected on this build, so MAI did not generate a transcript or MOM from unreliable text."
+            )
+            return@withContext Result.success()
+        }
+
         val audio = meeting.audioPath?.let(::File)?.takeIf { it.exists() && it.length() > 0 }
-            ?: return@withContext Result.success()
+            ?: run {
+                markUnavailable("Audio is unavailable, so an accurate transcript and MOM could not be generated.")
+                return@withContext Result.success()
+            }
 
         try {
             val boundary = "MAI-${UUID.randomUUID()}"
@@ -65,11 +85,23 @@ class AiEnhanceWorker(appContext: Context, params: WorkerParameters) : Coroutine
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
             val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
             connection.disconnect()
+
             if (code !in 200..299) {
-                return@withContext if (code >= 500 || code == 429) Result.retry() else Result.success()
+                if ((code >= 500 || code == 429) && runAttemptCount < 3) {
+                    return@withContext Result.retry()
+                }
+                markUnavailable("Accurate transcription could not be completed. The original audio is saved safely; no unreliable transcript or MOM was substituted.")
+                return@withContext Result.success()
             }
 
             val json = JSONObject(body)
+            val transcript = json.optString("transcript").trim()
+            val summary = json.optString("summary").trim()
+            if (transcript.isBlank() || summary.isBlank()) {
+                markUnavailable("The accuracy service returned an incomplete result. The original audio is saved safely; no unreliable transcript or MOM was substituted.")
+                return@withContext Result.success()
+            }
+
             val actionsArray = json.optJSONArray("actions") ?: JSONArray()
             val actions = (0 until actionsArray.length()).map { index ->
                 val item = actionsArray.getJSONObject(index)
@@ -84,14 +116,19 @@ class AiEnhanceWorker(appContext: Context, params: WorkerParameters) : Coroutine
 
             db.replaceIntelligence(
                 id = meeting.id,
-                transcript = json.optString("transcript").ifBlank { meeting.transcript },
-                summary = json.optString("summary").ifBlank { meeting.summary },
-                decisions = decisions.ifEmpty { meeting.decisions },
-                actions = actions.ifEmpty { meeting.actions }
+                transcript = transcript,
+                summary = summary,
+                decisions = decisions,
+                actions = actions
             )
             Result.success()
-        } catch (t: Throwable) {
-            if (runAttemptCount < 3) Result.retry() else Result.success()
+        } catch (_: Throwable) {
+            if (runAttemptCount < 3) {
+                Result.retry()
+            } else {
+                markUnavailable("Accurate transcription failed after retrying. The original audio is saved safely; no unreliable transcript or MOM was substituted.")
+                Result.success()
+            }
         }
     }
 }
