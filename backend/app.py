@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MAI_GATEWAY_TOKEN = os.getenv("MAI_GATEWAY_TOKEN", "").strip()
 STT_MODEL = os.getenv("MAI_STT_MODEL", "gpt-transcribe")
+LIVE_STT_MODEL = os.getenv("MAI_LIVE_STT_MODEL", "gpt-live-transcribe")
 TRANSLATE_MODEL = os.getenv("MAI_TRANSLATE_MODEL", "gpt-5.6-terra")
 MOM_MODEL = os.getenv("MAI_MOM_MODEL", "gpt-5.6-sol")
 OPENAI_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -35,7 +36,7 @@ DOMAIN_KEYWORDS = [
     "MOM",
 ]
 
-app = FastAPI(title="MAI Private Processing Gateway", version="1.1.1")
+app = FastAPI(title="MAI Private Processing Gateway", version="1.3.0")
 
 
 class Action(BaseModel):
@@ -51,6 +52,16 @@ class MeetingResult(BaseModel):
     decisions: list[str] = Field(default_factory=list)
     actions: list[Action] = Field(default_factory=list)
     language: str | None = None
+
+
+class RealtimeSecretRequest(BaseModel):
+    participants: list[str] = Field(default_factory=list)
+
+
+class RealtimeSecretResponse(BaseModel):
+    value: str
+    expires_at: int | None = None
+    websocket_url: str
 
 
 def require_auth(authorization: str | None) -> None:
@@ -85,15 +96,15 @@ def transcription_keywords(participant_names: list[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for value in [*participant_names, *DOMAIN_KEYWORDS]:
-        key = value.casefold().strip()
-        if value.strip() and key not in seen:
+        clean = value.replace("\n", " ").replace("\r", " ").replace("<", "").replace(">", "").strip()
+        key = clean.casefold()
+        if clean and key not in seen:
             seen.add(key)
-            result.append(value.strip())
+            result.append(clean)
     return result[:40]
 
 
 def language_hints() -> list[str]:
-    # MAI is primarily used for Tamil/English code-switching meetings.
     return ["ta", "en"]
 
 
@@ -118,15 +129,10 @@ def run_ffmpeg(input_path: Path, output_dir: Path) -> list[Path]:
 
 
 def transcribe_segment(path: Path, index: int, participant_names: list[str]) -> tuple[int, str]:
-    prompt = (
-        "This is a business meeting in Chennai. Speech may switch naturally between Tamil and English (Tanglish). "
-        "Transcribe exactly what is spoken. Do not translate or summarize. Preserve Tamil as Tamil, English as English, "
-        "and preserve names, brands, numbers, dates, prices, abbreviations and action wording. "
-        "When audio is unclear, do not invent words."
-    )
+    # Avoid an English-only free-text prompt here. Tamil/English code switching is guided
+    # using the model's native multiple-language and keyword hint fields instead.
     multipart: list[tuple[str, tuple[Any, ...]]] = [
         ("model", (None, STT_MODEL)),
-        ("prompt", (None, prompt)),
     ]
     for language in language_hints():
         multipart.append(("languages[]", (None, language)))
@@ -369,10 +375,61 @@ def health() -> dict[str, Any]:
         "openai_configured": bool(OPENAI_API_KEY),
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "stt_model": STT_MODEL,
+        "live_stt_model": LIVE_STT_MODEL,
         "translate_model": TRANSLATE_MODEL,
         "mom_model": MOM_MODEL,
         "languages": language_hints(),
     }
+
+
+@app.post("/v1/realtime/client-secret", response_model=RealtimeSecretResponse)
+def realtime_client_secret(
+    request: RealtimeSecretRequest,
+    authorization: str | None = Header(default=None),
+) -> RealtimeSecretResponse:
+    require_auth(authorization)
+    keywords = transcription_keywords(request.participants)
+    payload = {
+        "expires_after": {"anchor": "created_at", "seconds": 600},
+        "session": {
+            "type": "transcription",
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "noise_reduction": {"type": "far_field"},
+                    "transcription": {
+                        "model": LIVE_STT_MODEL,
+                        "languages": language_hints(),
+                        "keywords": keywords,
+                        "delay": "high",
+                    },
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.45,
+                        "prefix_padding_ms": 350,
+                        "silence_duration_ms": 650,
+                    },
+                }
+            },
+        },
+    }
+    with httpx.Client(timeout=httpx.Timeout(30.0, connect=15.0)) as client:
+        response = client.post(
+            f"{OPENAI_BASE}/realtime/client_secrets",
+            headers={**openai_headers(), "Content-Type": "application/json"},
+            json=payload,
+        )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Realtime token service failed ({response.status_code})")
+    data = response.json()
+    value = str(data.get("value", "")).strip()
+    if not value:
+        raise HTTPException(status_code=502, detail="Realtime token service returned no client secret")
+    return RealtimeSecretResponse(
+        value=value,
+        expires_at=data.get("expires_at"),
+        websocket_url=f"wss://api.openai.com/v1/realtime?model={LIVE_STT_MODEL}",
+    )
 
 
 @app.post("/v1/meetings/process", response_model=MeetingResult)
