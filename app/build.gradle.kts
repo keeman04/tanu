@@ -13,12 +13,12 @@ android {
         applicationId = "com.mai.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.1.3"
+        versionCode = 10
+        versionName = "1.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
-        buildConfigField("String", "MAI_BACKEND_URL", quotedBuildValue(providers.gradleProperty("MAI_BACKEND_URL").orElse("").get()))
-        buildConfigField("String", "MAI_GATEWAY_TOKEN", quotedBuildValue(providers.gradleProperty("MAI_GATEWAY_TOKEN").orElse("").get()))
+        buildConfigField("String", "MAI_BACKEND_URL", quotedBuildValue("https://mai-integrated-ai-keeman04-6969s-projects.vercel.app"))
+        buildConfigField("String", "MAI_GATEWAY_TOKEN", quotedBuildValue(""))
     }
 
     buildTypes {
@@ -48,6 +48,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.work:work-runtime-ktx:2.10.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")
@@ -56,9 +57,6 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    // V1.1.3 keeps the legacy Vosk binaries only for source/binary compatibility.
-    // SpeechTranscriber is intentionally a no-op because English-only recognition is unsafe
-    // for Tamil/Tanglish meetings. Final text must come from MAI's multilingual backend.
     implementation("com.alphacephei:vosk-android:0.3.75")
     implementation("com.alphacephei:vosk-model-en:0.3.38")
 
