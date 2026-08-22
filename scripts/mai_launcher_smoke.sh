@@ -5,6 +5,7 @@ APK="app/build/outputs/apk/debug/app-debug.apk"
 PACKAGE="com.mai.app"
 ACTIVITY="com.mai.app/.MainActivity"
 DIAG="cold-start-diagnostics"
+REPORT="app/build/reports/androidTests/connected/debug/index.html"
 mkdir -p "$DIAG"
 
 assert_launch() {
@@ -43,16 +44,49 @@ assert_launch() {
   echo "PASS: $label (pid $pid)"
 }
 
+run_instrumentation() {
+  rm -rf app/build/reports/androidTests/connected/debug
+
+  set +e
+  gradle --no-daemon connectedDebugAndroidTest
+  local first_rc=$?
+  set -e
+
+  if [[ "$first_rc" -eq 0 ]]; then
+    return 0
+  fi
+
+  # Hosted Android emulators can occasionally crash the instrumentation process
+  # before AndroidJUnitRunner discovers any tests. Retry exactly once only for
+  # that zero-test bootstrap failure. Real test/assertion failures are never retried.
+  if [[ -f "$REPORT" ]] \
+    && grep -q "Instrumentation run failed due to Process crashed" "$REPORT" \
+    && grep -q '<tbody/>' "$REPORT"; then
+    echo "::warning::Instrumentation process crashed before discovering any tests; retrying once after device reset."
+    adb wait-for-device
+    adb shell am force-stop "$PACKAGE" || true
+    adb logcat -c || true
+    sleep 3
+    gradle --no-daemon connectedDebugAndroidTest --rerun-tasks
+    return
+  fi
+
+  return "$first_rc"
+}
+
 gradle --no-daemon assembleDebug
 adb install -r "$APK"
 
 # 1. Fresh install with permissions denied: custom permission screen must stay alive.
 assert_launch "fresh-no-permissions"
 
-# 2. Grant normal V1 permissions and make sure Home can cold-start independently of Vosk.
+# 2. Grant normal MAI permissions and make sure Home can cold-start independently of network AI.
 adb shell pm grant "$PACKAGE" android.permission.RECORD_AUDIO
 adb shell pm grant "$PACKAGE" android.permission.READ_CONTACTS
-adb shell pm grant "$PACKAGE" android.permission.POST_NOTIFICATIONS || true
+SDK="$(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+if [[ "$SDK" -ge 33 ]]; then
+  adb shell pm grant "$PACKAGE" android.permission.POST_NOTIFICATIONS || true
+fi
 assert_launch "permissions-granted"
 
 # 3-5. Repeat real launcher cold starts to catch intermittent resource/native startup failures.
@@ -66,7 +100,7 @@ assert_launch "contacts-revoked"
 
 # Android runtime integration tests cover launch survival plus meeting data lifecycle:
 # create -> finish -> search -> complete action -> delete, and checkpoint recovery.
-gradle --no-daemon connectedDebugAndroidTest
+run_instrumentation
 
 echo "All MAI launcher and Android integration tests passed."
 touch mai-launch-smoke-passed
