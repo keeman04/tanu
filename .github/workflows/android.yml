@@ -29,13 +29,44 @@ jobs:
         run: gradle --no-daemon testDebugUnitTest
       - name: Android lint
         run: gradle --no-daemon lintDebug
-      - name: Build APK
-        run: gradle --no-daemon assembleDebug
+      - name: Check MAI backend configuration
+        env:
+          MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
+        run: |
+          if [ -n "$MAI_BACKEND_URL" ]; then
+            echo "MAI backend URL is configured for this APK."
+          else
+            echo "::warning::MAI_BACKEND_URL is not configured. Recording works, but final Tamil/Tanglish AI enhancement remains in recorded/pending state."
+          fi
+      - name: Build hardened QA APK
+        env:
+          MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
+          MAI_GATEWAY_TOKEN: ${{ secrets.MAI_GATEWAY_TOKEN }}
+        run: gradle --no-daemon assembleQa -PMAI_BACKEND_URL="$MAI_BACKEND_URL" -PMAI_GATEWAY_TOKEN="$MAI_GATEWAY_TOKEN"
+      - name: Reject oversized APK regressions
+        run: |
+          APK=app/build/outputs/apk/qa/app-qa.apk
+          SIZE=$(stat -c%s "$APK")
+          MAX=$((50 * 1024 * 1024))
+          echo "APK size: $SIZE bytes"
+          if [ "$SIZE" -gt "$MAX" ]; then
+            echo "::error::APK is larger than 50 MiB. Check for accidentally packaged speech models/native assets."
+            exit 1
+          fi
+      - name: Ensure Vosk model is not packaged
+        run: |
+          APK=app/build/outputs/apk/qa/app-qa.apk
+          if unzip -l "$APK" | grep -Eiq 'vosk|model-en-us'; then
+            echo "::error::Unused Vosk/English speech model is still packaged."
+            exit 1
+          fi
+          echo "No Vosk speech model found in APK."
       - name: Validate 16 KiB arm64 native alignment
         run: |
+          APK=app/build/outputs/apk/qa/app-qa.apk
           rm -rf /tmp/mai-apk-check
           mkdir -p /tmp/mai-apk-check
-          unzip -q app/build/outputs/apk/debug/app-debug.apk 'lib/arm64-v8a/*.so' -d /tmp/mai-apk-check
+          unzip -q "$APK" 'lib/arm64-v8a/*.so' -d /tmp/mai-apk-check || true
           python3 - <<'PY'
           import glob, subprocess, sys
           bad = []
@@ -53,13 +84,13 @@ jobs:
               for path, align in bad:
                   print(f'  {path}: {align}')
               sys.exit(1)
-          print('All arm64 native LOAD segments are at least 16 KiB aligned.')
+          print('All packaged arm64 native LOAD segments are at least 16 KiB aligned.')
           PY
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.0.0-Android
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: MAI-V1.3.0-Hardened-QA
+          path: app/build/outputs/apk/qa/app-qa.apk
           retention-days: 30
           if-no-files-found: error
 
@@ -71,6 +102,10 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

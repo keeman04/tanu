@@ -92,7 +92,8 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
         decisions: List<String>,
         actions: List<ActionRecord>,
         audioPath: String?,
-        audioExpiresAt: Long?
+        audioExpiresAt: Long?,
+        status: String = "ready"
     ) {
         writableDatabase.update("meetings", ContentValues().apply {
             put("ended_at", endedAt)
@@ -102,7 +103,14 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
             put("actions", actionsToJson(actions))
             if (audioPath == null) putNull("audio_path") else put("audio_path", audioPath)
             if (audioExpiresAt == null) putNull("audio_expires_at") else put("audio_expires_at", audioExpiresAt)
-            put("status", "ready")
+            put("status", status)
+        }, "id=?", arrayOf(id))
+    }
+
+    fun updateStatus(id: String, status: String, summary: String? = null) {
+        writableDatabase.update("meetings", ContentValues().apply {
+            put("status", status)
+            if (summary != null) put("summary", summary)
         }, "id=?", arrayOf(id))
     }
 

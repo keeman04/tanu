@@ -56,4 +56,33 @@ class MaiDataInstrumentedTest {
         assertEquals("Checkpointed transcript survives", recovered?.transcript)
         db.deleteMeeting(id)
     }
+
+    @Test
+    fun meetingDoesNotBecomeReadyUntilFinalIntelligenceArrives() {
+        val db = MaiDb(context)
+        val id = db.createMeeting("Processing State", listOf(Participant("Ravi", "9999999999")))
+        db.finishMeeting(
+            id = id,
+            endedAt = 1_800_000_060_000L,
+            transcript = "Live preview only",
+            summary = "Audio saved safely. Processing.",
+            decisions = emptyList(),
+            actions = emptyList(),
+            audioPath = null,
+            audioExpiresAt = null,
+            status = "processing"
+        )
+        assertEquals("processing", db.getMeeting(id)?.status)
+
+        db.replaceIntelligence(
+            id = id,
+            transcript = "Verified final transcript",
+            summary = "Verified final MOM",
+            decisions = listOf("Approved"),
+            actions = listOf(ActionRecord("Send final file", "Ravi", "2026-08-24"))
+        )
+        assertEquals("ready", db.getMeeting(id)?.status)
+        assertEquals("Verified final transcript", db.getMeeting(id)?.transcript)
+        db.deleteMeeting(id)
+    }
 }
