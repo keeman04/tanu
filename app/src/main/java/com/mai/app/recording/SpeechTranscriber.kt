@@ -3,6 +3,7 @@ package com.mai.app.recording
 import android.content.Context
 import android.util.Base64
 import com.mai.app.BuildConfig
+import com.mai.app.auth.MaiDeviceAuth
 import com.mai.app.data.MaiDb
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -40,9 +41,11 @@ class SpeechTranscriber(
         private val RECONNECT_DELAYS_MS = longArrayOf(1_000, 2_000, 4_000, 8_000, 15_000)
     }
 
+    private val appContext = context.applicationContext
+    private val auth = MaiDeviceAuth(appContext)
     private val names: List<String> = participantNames.ifEmpty {
         runCatching {
-            MaiDb(context.applicationContext).listMeetings()
+            MaiDb(appContext).listMeetings()
                 .firstOrNull { it.status == "recording" }
                 ?.participants
                 ?.map { it.name }
@@ -99,7 +102,12 @@ class SpeechTranscriber(
             onWarning("Live transcription is unavailable until the MAI backend is configured.")
             return true
         }
+        if (!auth.isActivated()) {
+            onWarning("Live transcription is unavailable until this MAI device is activated.")
+            return true
+        }
         return try {
+            val sessionToken = auth.sessionToken()
             val payload = JSONObject()
                 .put("participants", JSONArray().apply { names.forEach { put(it) } })
                 .toString()
@@ -107,15 +115,14 @@ class SpeechTranscriber(
                 .url("$base/v1/realtime/client-secret")
                 .post(payload.toRequestBody("application/json".toMediaType()))
                 .header("Accept", "application/json")
-                .apply {
-                    BuildConfig.MAI_GATEWAY_TOKEN.trim().takeIf(String::isNotBlank)?.let {
-                        header("Authorization", "Bearer $it")
-                    }
-                }
+                .header("Authorization", "Bearer $sessionToken")
                 .build()
 
             client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw IllegalStateException("token service returned ${response.code}")
+                if (!response.isSuccessful) {
+                    if (response.code == 401 || response.code == 403) MaiDeviceAuth.invalidateSession()
+                    throw IllegalStateException("token service returned ${response.code}")
+                }
                 val json = JSONObject(response.body?.string().orEmpty())
                 val token = json.optString("value").trim()
                 val url = json.optString("websocket_url").trim()
@@ -268,6 +275,7 @@ class SpeechTranscriber(
             active?.cancel()
         }
         ready.set(false)
+        auth.close()
         client.dispatcher.executorService.shutdown()
         client.connectionPool.evictAll()
     }
