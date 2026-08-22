@@ -16,6 +16,8 @@ data class RecordingSnapshot(
     val partial: String = "",
     val status: String = "idle",
     val audioSafe: Boolean = false,
+    val storageWarning: String? = null,
+    val interruption: String? = null,
     val error: String? = null
 )
 
