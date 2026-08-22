@@ -103,26 +103,29 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.mai.app.R
-import com.mai.app.data.ActionRecord
 import com.mai.app.data.MaiDb
 import com.mai.app.data.MeetingRecord
 import com.mai.app.data.Participant
 import com.mai.app.recording.RecordingBus
+import com.mai.app.recording.RecordingPreflight
 import com.mai.app.recording.RecordingService
 import com.mai.app.recording.RecordingSnapshot
 import com.mai.app.share.PdfShare
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.DateFormat
 import java.util.Date
 
-private val BrandDark = Color(0xFF102826)
-private val BrandTeal = Color(0xFF20A98F)
-private val BrandLime = Color(0xFFD8F36A)
-private val BrandCream = Color(0xFFF6F6EF)
-private val DarkSurface = Color(0xFF183431)
-private val SoftMint = Color(0xFFE8F5F1)
+private val BrandBlue = Color(0xFF2563EB)
+private val BrandViolet = Color(0xFF8A2BE2)
+private val BrandDark = Color(0xFF0F172A)
+private val BrandCream = Color(0xFFF7F9FF)
+private val DarkSurface = Color(0xFF172033)
+private val SoftBlue = Color(0xFFE7EEFF)
 private val SafeGreen = Color(0xFF1F9D69)
+private val WarningAmber = Color(0xFFB26A00)
 
 private sealed interface Screen {
     data object Home : Screen
@@ -143,18 +146,18 @@ fun MaiRoot() {
     val dark = when (themeMode) { 1 -> false; 2 -> true; else -> isSystemInDarkTheme() }
     val colors = if (dark) {
         darkColorScheme(
-            primary = BrandLime,
-            secondary = BrandTeal,
+            primary = BrandBlue,
+            secondary = BrandViolet,
             background = BrandDark,
             surface = DarkSurface,
             onBackground = Color.White,
             onSurface = Color.White,
-            onPrimary = BrandDark
+            onPrimary = Color.White
         )
     } else {
         lightColorScheme(
-            primary = BrandDark,
-            secondary = BrandTeal,
+            primary = BrandBlue,
+            secondary = BrandViolet,
             background = BrandCream,
             surface = Color.White,
             onBackground = BrandDark,
@@ -181,16 +184,15 @@ private fun Splash(dark: Boolean) {
         scale.animateTo(1f, tween(520, easing = EaseOutCubic))
         alpha.animateTo(1f, tween(360))
     }
-    Box(
-        Modifier.fillMaxSize().background(if (dark) BrandDark else BrandCream),
-        contentAlignment = Alignment.Center
-    ) {
+    Box(Modifier.fillMaxSize().background(if (dark) BrandDark else BrandCream), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Image(
                 painterResource(R.drawable.mai_brand_mark),
                 "MAI",
                 Modifier.size(108.dp).graphicsLayer {
-                    scaleX = scale.value; scaleY = scale.value; this.alpha = alpha.value
+                    scaleX = scale.value
+                    scaleY = scale.value
+                    this.alpha = alpha.value
                 }
             )
             Spacer(Modifier.height(12.dp))
@@ -216,7 +218,9 @@ private fun PermissionGate(themeMode: Int, onTheme: (Int) -> Unit) {
                 launcher.launch(ask.toTypedArray())
             },
             onSettings = {
-                context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+                runCatching {
+                    context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+                }
             }
         )
     } else MaiApp(themeMode, onTheme)
@@ -230,7 +234,7 @@ private fun PermissionScreen(onAllow: () -> Unit, onSettings: () -> Unit) {
             Image(painterResource(R.drawable.mai_brand_mark), "MAI", Modifier.size(82.dp))
             Spacer(Modifier.height(15.dp))
             Text("MAI", fontSize = 34.sp, fontWeight = FontWeight.Bold)
-            Text("Microphone and contacts stay under your control.", color = MaterialTheme.colorScheme.onSurface.copy(alpha = .55f))
+            Text("Microphone and contacts are required for MAI V1.", color = MaterialTheme.colorScheme.onSurface.copy(alpha = .55f))
             Spacer(Modifier.height(26.dp))
             PermissionRow(Icons.Default.Mic, "Microphone", "Record meetings")
             PermissionRow(Icons.Default.People, "Contacts", "Add participants")
@@ -244,11 +248,14 @@ private fun PermissionScreen(onAllow: () -> Unit, onSettings: () -> Unit) {
 @Composable
 private fun PermissionRow(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, note: String) {
     Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(42.dp).background(SoftMint, CircleShape), contentAlignment = Alignment.Center) {
-            Icon(icon, null, tint = BrandTeal)
+        Box(Modifier.size(42.dp).background(SoftBlue, CircleShape), contentAlignment = Alignment.Center) {
+            Icon(icon, null, tint = BrandBlue)
         }
         Spacer(Modifier.width(12.dp))
-        Column { Text(label, fontWeight = FontWeight.SemiBold); Text(note, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .45f)) }
+        Column {
+            Text(label, fontWeight = FontWeight.SemiBold)
+            Text(note, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .45f))
+        }
     }
 }
 
@@ -285,9 +292,17 @@ private fun MaiApp(themeMode: Int, onTheme: (Int) -> Unit) {
                 Screen.Ask -> AskMai(db, revision) { screen = Screen.Detail(it) }
                 Screen.Settings -> SettingsPage(themeMode, onTheme)
                 Screen.NewMeeting -> NewMeeting(db, { screen = Screen.Home }) { screen = Screen.Recording }
-                Screen.Recording -> RecordingPage(recording) {
-                    context.startService(Intent(context, RecordingService::class.java).setAction(RecordingService.ACTION_STOP))
-                }
+                Screen.Recording -> RecordingPage(
+                    state = recording,
+                    onStop = {
+                        runCatching {
+                            context.startService(Intent(context, RecordingService::class.java).setAction(RecordingService.ACTION_STOP))
+                        }.onFailure { error ->
+                            RecordingBus.update { old -> old.copy(error = error.message ?: "Unable to stop recording") }
+                        }
+                    },
+                    onExit = { revision++; screen = Screen.Home }
+                )
                 is Screen.Detail -> MeetingDetail(db, current.id, { revision++; screen = Screen.Meetings }, { revision++ })
             }
         }
@@ -317,7 +332,7 @@ private fun Home(
     onAsk: () -> Unit
 ) {
     val meetings = remember(revision) { db.listMeetings() }
-    val openActions = meetings.sumOf { it.actions.count { a -> !a.done } }
+    val openActions = meetings.sumOf { it.actions.count { action -> !action.done } }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(13.dp)) {
         item {
             BrandHeader(); Spacer(Modifier.height(24.dp))
@@ -331,7 +346,8 @@ private fun Home(
                         modifier = Modifier.fillMaxWidth().height(58.dp),
                         shape = RoundedCornerShape(18.dp)
                     ) {
-                        Icon(Icons.Default.Mic, null); Spacer(Modifier.width(8.dp)); Text(if (recording) "Return to recording" else "Start meeting", fontWeight = FontWeight.Bold)
+                        Icon(Icons.Default.Mic, null); Spacer(Modifier.width(8.dp))
+                        Text(if (recording) "Return to recording" else "Start meeting", fontWeight = FontWeight.Bold)
                     }
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(onClick = onAsk, modifier = Modifier.fillMaxWidth()) {
@@ -354,7 +370,10 @@ private fun Home(
 @Composable
 private fun StatCard(value: String, label: String, modifier: Modifier) {
     Card(modifier, shape = RoundedCornerShape(18.dp)) {
-        Column(Modifier.padding(15.dp)) { Text(value, fontSize = 26.sp, fontWeight = FontWeight.Bold); Text(label, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) }
+        Column(Modifier.padding(15.dp)) {
+            Text(value, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+            Text(label, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f))
+        }
     }
 }
 
@@ -362,12 +381,14 @@ private fun StatCard(value: String, label: String, modifier: Modifier) {
 private fun MeetingCard(meeting: MeetingRecord, onClick: () -> Unit) {
     Card(Modifier.fillMaxWidth().clickable(onClick = onClick), shape = RoundedCornerShape(18.dp)) {
         Row(Modifier.padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(43.dp).background(SoftMint, RoundedCornerShape(13.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Description, null, tint = BrandTeal) }
+            Box(Modifier.size(43.dp).background(SoftBlue, RoundedCornerShape(13.dp)), contentAlignment = Alignment.Center) {
+                Icon(Icons.Default.Description, null, tint = BrandBlue)
+            }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(meeting.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(meeting.startedAt)), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .45f))
-                if (meeting.status == "interrupted") Text("Recovered after interruption", fontSize = 11.sp, color = Color(0xFFB26A00))
+                if (meeting.status == "interrupted") Text("Recovered after interruption", fontSize = 11.sp, color = WarningAmber)
             }
             if (meeting.status == "ready") Icon(Icons.Default.Check, null, tint = SafeGreen)
         }
@@ -381,6 +402,8 @@ private fun NewMeeting(db: MaiDb, onBack: () -> Unit, onStarted: () -> Unit) {
     val people = remember { mutableStateListOf<Participant>() }
     var contactsOpen by remember { mutableStateOf(false) }
     var manualOpen by remember { mutableStateOf(false) }
+    var startError by remember { mutableStateOf<String?>(null) }
+    val initialStorage = remember { RecordingPreflight.storageState(context) }
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         BackHeader("New meeting", onBack)
@@ -405,18 +428,41 @@ private fun NewMeeting(db: MaiDb, onBack: () -> Unit, onStarted: () -> Unit) {
             }
         }
         Spacer(Modifier.weight(1f))
+        initialStorage.warning?.let { Text(it, fontSize = 12.sp, color = WarningAmber) }
+        startError?.let { Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 6.dp)) }
         Text("By starting, make sure everyone knows the meeting is being recorded.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .45f))
         Spacer(Modifier.height(9.dp))
         Button(
             onClick = {
-                val id = db.createMeeting(title, people.toList())
-                ContextCompat.startForegroundService(context, Intent(context, RecordingService::class.java).setAction(RecordingService.ACTION_START).putExtra(RecordingService.EXTRA_MEETING_ID, id))
-                onStarted()
+                startError = null
+                val issue = RecordingPreflight.blockingIssue(context)
+                if (issue != null) {
+                    startError = issue
+                } else {
+                    var createdId: String? = null
+                    runCatching {
+                        createdId = db.createMeeting(title, people.toList())
+                        val component = ContextCompat.startForegroundService(
+                            context,
+                            Intent(context, RecordingService::class.java)
+                                .setAction(RecordingService.ACTION_START)
+                                .putExtra(RecordingService.EXTRA_MEETING_ID, createdId)
+                        )
+                        check(component != null) { "Android did not start the recording service" }
+                    }.onSuccess {
+                        onStarted()
+                    }.onFailure { error ->
+                        createdId?.let { runCatching { db.deleteMeeting(it) } }
+                        startError = error.message ?: "Unable to start recording. Please try again."
+                    }
+                }
             },
             enabled = people.isNotEmpty(),
             modifier = Modifier.fillMaxWidth().height(56.dp),
             shape = RoundedCornerShape(18.dp)
-        ) { Icon(Icons.Default.Mic, null); Spacer(Modifier.width(8.dp)); Text("Start recording", fontWeight = FontWeight.Bold) }
+        ) {
+            Icon(Icons.Default.Mic, null); Spacer(Modifier.width(8.dp)); Text("Start recording", fontWeight = FontWeight.Bold)
+        }
     }
 
     if (contactsOpen) ContactsDialog({ contactsOpen = false }) { person ->
@@ -431,14 +477,17 @@ private fun NewMeeting(db: MaiDb, onBack: () -> Unit, onStarted: () -> Unit) {
 
 @Composable
 private fun CircleInitial(name: String) {
-    Box(Modifier.size(38.dp).background(SoftMint, CircleShape), contentAlignment = Alignment.Center) { Text(name.take(1).uppercase(), color = BrandTeal, fontWeight = FontWeight.Bold) }
+    Box(Modifier.size(38.dp).background(SoftBlue, CircleShape), contentAlignment = Alignment.Center) {
+        Text(name.take(1).uppercase(), color = BrandBlue, fontWeight = FontWeight.Bold)
+    }
 }
 
 @Composable
 private fun ContactsDialog(onDismiss: () -> Unit, onPick: (Participant) -> Unit) {
     val context = LocalContext.current
-    val contacts = remember { readContacts(context) }
+    var contacts by remember { mutableStateOf<List<Participant>>(emptyList()) }
     var query by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) { contacts = withContext(Dispatchers.IO) { readContacts(context) } }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Contacts") },
@@ -449,7 +498,8 @@ private fun ContactsDialog(onDismiss: () -> Unit, onPick: (Participant) -> Unit)
                 LazyColumn {
                     items(contacts.filter { query.isBlank() || it.name.contains(query, true) || it.phone.contains(query) }) { person ->
                         Row(Modifier.fillMaxWidth().clickable { onPick(person) }.padding(vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                            CircleInitial(person.name); Spacer(Modifier.width(9.dp)); Column { Text(person.name, fontWeight = FontWeight.SemiBold); Text(person.phone, fontSize = 12.sp) }
+                            CircleInitial(person.name); Spacer(Modifier.width(9.dp))
+                            Column { Text(person.name, fontWeight = FontWeight.SemiBold); Text(person.phone, fontSize = 12.sp) }
                         }
                     }
                 }
@@ -463,7 +513,13 @@ private fun readContacts(context: Context): List<Participant> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return emptyList()
     val result = LinkedHashMap<String, Participant>()
     val projection = arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER)
-    context.contentResolver.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI, projection, null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC")?.use { cursor ->
+    context.contentResolver.query(
+        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+        projection,
+        null,
+        null,
+        ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC"
+    )?.use { cursor ->
         val nameIndex = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
         val phoneIndex = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER)
         while (cursor.moveToNext()) {
@@ -483,7 +539,13 @@ private fun ManualDialog(onDismiss: () -> Unit, onAdd: (Participant) -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add participant") },
-        text = { Column { OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true); Spacer(Modifier.height(8.dp)); OutlinedTextField(phone, { phone = it }, label = { Text("WhatsApp number") }, singleLine = true) } },
+        text = {
+            Column {
+                OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(phone, { phone = it }, label = { Text("WhatsApp number") }, singleLine = true)
+            }
+        },
         confirmButton = { Button({ onAdd(Participant(name.trim(), phone.trim())) }, enabled = valid) { Text("Add") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
@@ -492,32 +554,56 @@ private fun ManualDialog(onDismiss: () -> Unit, onAdd: (Participant) -> Unit) {
 private fun normalizePhone(value: String): String = value.filter { it.isDigit() || it == '+' }
 
 @Composable
-private fun RecordingPage(state: RecordingSnapshot, onStop: () -> Unit) {
+private fun RecordingPage(state: RecordingSnapshot, onStop: () -> Unit, onExit: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         BrandHeader(); Spacer(Modifier.height(30.dp))
         Text(formatElapsed(state.elapsedMs), fontSize = 44.sp, fontWeight = FontWeight.Light)
         Spacer(Modifier.height(18.dp))
         VolumeWaveform(state.levels, Modifier.fillMaxWidth().height(120.dp))
-        Text(if (state.level <= 0f) "Listening" else "Voice detected", color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f))
+        Text(
+            when (state.status) {
+                "interrupted" -> "Microphone interrupted"
+                "reconnecting" -> "Reconnecting microphone"
+                else -> if (state.level <= 0f) "Listening" else "Voice detected"
+            },
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = .55f)
+        )
         Spacer(Modifier.height(14.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusChip("Recording", BrandTeal)
-            StatusChip(if (state.audioSafe) "Audio checkpointed" else "Securing audio", if (state.audioSafe) SafeGreen else Color(0xFFB26A00))
+            StatusChip(if (state.active) "Recording" else "Stopped", if (state.active) BrandBlue else WarningAmber)
+            StatusChip(if (state.audioSafe) "Audio checkpointed" else "Securing audio", if (state.audioSafe) SafeGreen else WarningAmber)
         }
-        Spacer(Modifier.height(16.dp))
+        state.interruption?.let { Text(it, color = WarningAmber, fontSize = 12.sp, modifier = Modifier.padding(top = 9.dp)) }
+        state.storageWarning?.let { Text(it, color = WarningAmber, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp)) }
+        state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp)) }
+        Spacer(Modifier.height(14.dp))
         Card(Modifier.fillMaxWidth().weight(1f), shape = RoundedCornerShape(20.dp)) {
             LazyColumn(Modifier.padding(17.dp)) {
                 item { Text("Live transcript", fontWeight = FontWeight.Bold); Spacer(Modifier.height(8.dp)) }
                 item {
-                    val text = buildString { append(state.transcript); if (state.partial.isNotBlank()) { if (isNotBlank()) append('\n'); append(state.partial) } }
-                    Text(text.ifBlank { "MAI is recording. Live text appears when offline speech recognition is available." }, lineHeight = 22.sp)
+                    val text = buildString {
+                        append(state.transcript)
+                        if (state.partial.isNotBlank()) {
+                            if (isNotBlank()) append('\n')
+                            append(state.partial)
+                        }
+                    }
+                    Text(text.ifBlank { "MAI is recording. Audio remains the source of truth even when live transcription is unavailable." }, lineHeight = 22.sp)
                 }
             }
         }
-        state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 6.dp)) }
         Spacer(Modifier.height(12.dp))
-        Button(onClick = onStop, modifier = Modifier.fillMaxWidth().height(58.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB5273E)), shape = RoundedCornerShape(18.dp)) {
-            Icon(Icons.Default.Stop, null); Spacer(Modifier.width(8.dp)); Text("Stop meeting", fontWeight = FontWeight.Bold)
+        if (state.active) {
+            Button(
+                onClick = onStop,
+                modifier = Modifier.fillMaxWidth().height(58.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB5273E)),
+                shape = RoundedCornerShape(18.dp)
+            ) {
+                Icon(Icons.Default.Stop, null); Spacer(Modifier.width(8.dp)); Text("Stop meeting", fontWeight = FontWeight.Bold)
+            }
+        } else if (state.error != null) {
+            Button(onClick = onExit, modifier = Modifier.fillMaxWidth().height(54.dp)) { Text("Back to Home") }
         }
     }
 }
@@ -527,13 +613,19 @@ private fun VolumeWaveform(levels: List<Float>, modifier: Modifier) {
     Canvas(modifier) {
         val mid = size.height / 2f
         val values = if (levels.isEmpty()) List(48) { 0f } else levels
-        if (values.all { it <= .001f }) drawLine(BrandTeal.copy(alpha = .5f), Offset(0f, mid), Offset(size.width, mid), strokeWidth = 4f, cap = StrokeCap.Round)
-        else {
+        if (values.all { it <= .001f }) {
+            drawLine(BrandBlue.copy(alpha = .5f), Offset(0f, mid), Offset(size.width, mid), strokeWidth = 4f, cap = StrokeCap.Round)
+        } else {
             val gap = 4f
             val width = ((size.width - gap * (values.size - 1)) / values.size).coerceAtLeast(2f)
             values.forEachIndexed { index, level ->
                 val amplitude = if (level <= 0f) 2f else 8f + level * size.height * .8f
-                drawRoundRect(Brush.verticalGradient(listOf(BrandTeal, BrandLime)), Offset(index * (width + gap), mid - amplitude / 2f), Size(width, amplitude), CornerRadius(width / 2f, width / 2f))
+                drawRoundRect(
+                    Brush.verticalGradient(listOf(BrandBlue, BrandViolet)),
+                    Offset(index * (width + gap), mid - amplitude / 2f),
+                    Size(width, amplitude),
+                    CornerRadius(width / 2f, width / 2f)
+                )
             }
         }
     }
@@ -542,7 +634,8 @@ private fun VolumeWaveform(levels: List<Float>, modifier: Modifier) {
 @Composable
 private fun StatusChip(text: String, color: Color) {
     Row(Modifier.background(color.copy(alpha = .12f), RoundedCornerShape(50)).padding(horizontal = 11.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(7.dp).background(color, CircleShape)); Spacer(Modifier.width(5.dp)); Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        Box(Modifier.size(7.dp).background(color, CircleShape)); Spacer(Modifier.width(5.dp))
+        Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -551,7 +644,10 @@ private fun Meetings(db: MaiDb, revision: Int, onMeeting: (String) -> Unit) {
     var query by remember { mutableStateOf("") }
     val meetings = remember(revision, query) { db.searchMeetings(query) }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        item { BrandHeader(); Spacer(Modifier.height(18.dp)); Text("Meetings", fontSize = 28.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.height(10.dp)); OutlinedTextField(query, { query = it }, leadingIcon = { Icon(Icons.Default.Search, null) }, placeholder = { Text("Search meetings, people, decisions…") }, singleLine = true, modifier = Modifier.fillMaxWidth()) }
+        item {
+            BrandHeader(); Spacer(Modifier.height(18.dp)); Text("Meetings", fontSize = 28.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.height(10.dp))
+            OutlinedTextField(query, { query = it }, leadingIcon = { Icon(Icons.Default.Search, null) }, placeholder = { Text("Search meetings, people, decisions…") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        }
         items(meetings) { MeetingCard(it) { onMeeting(it.id) } }
         if (meetings.isEmpty()) item { Empty("No matching meetings") }
     }
@@ -560,17 +656,21 @@ private fun Meetings(db: MaiDb, revision: Int, onMeeting: (String) -> Unit) {
 @Composable
 private fun Actions(db: MaiDb, revision: Int, onChanged: () -> Unit) {
     val meetings = remember(revision) { db.listMeetings() }
-    val rows = remember(meetings) { meetings.flatMap { m -> m.actions.mapIndexed { index, action -> Triple(m, index, action) } }.sortedBy { it.third.done } }
+    val rows = remember(meetings) {
+        meetings.flatMap { meeting -> meeting.actions.mapIndexed { index, action -> Triple(meeting, index, action) } }.sortedBy { it.third.done }
+    }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item { BrandHeader(); Spacer(Modifier.height(18.dp)); Text("Actions", fontSize = 28.sp, fontWeight = FontWeight.Bold); Text("Tap the circle when an action is completed.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) }
         items(rows) { (meeting, index, action) ->
             Card(shape = RoundedCornerShape(18.dp)) {
                 Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconButton({ db.updateActionDone(meeting.id, index, !action.done); onChanged() }) { Icon(if (action.done) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked, null, tint = if (action.done) SafeGreen else BrandTeal) }
+                    IconButton({ db.updateActionDone(meeting.id, index, !action.done); onChanged() }) {
+                        Icon(if (action.done) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked, null, tint = if (action.done) SafeGreen else BrandBlue)
+                    }
                     Column(Modifier.weight(1f)) {
                         Text(action.text, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (action.done) .45f else 1f))
                         val meta = listOfNotNull(action.owner, action.due).joinToString(" · ")
-                        if (meta.isNotBlank()) Text(meta, fontSize = 12.sp, color = BrandTeal)
+                        if (meta.isNotBlank()) Text(meta, fontSize = 12.sp, color = BrandBlue)
                         Text(meeting.title, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .4f))
                     }
                 }
@@ -593,11 +693,11 @@ private fun AskMai(db: MaiDb, revision: Int, onMeeting: (String) -> Unit) {
             OutlinedTextField(query, { query = it }, leadingIcon = { Icon(Icons.Default.Search, null) }, placeholder = { Text("What did we decide about pricing?") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         }
         if (query.isBlank()) {
-            item { Suggestion("Try: Ravi", { query = "Ravi" }); Suggestion("Try: pricing", { query = "pricing" }); Suggestion("Try: follow up", { query = "follow up" }) }
+            item { Suggestion("Try: Ravi") { query = "Ravi" }; Suggestion("Try: pricing") { query = "pricing" }; Suggestion("Try: follow up") { query = "follow up" } }
         } else {
             item {
-                Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = .08f))) {
-                    Column(Modifier.padding(16.dp)) { Text("MAI", fontWeight = FontWeight.Bold, color = BrandTeal); Spacer(Modifier.height(6.dp)); Text(answer, lineHeight = 21.sp) }
+                Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BrandBlue.copy(alpha = .08f))) {
+                    Column(Modifier.padding(16.dp)) { Text("MAI", fontWeight = FontWeight.Bold, color = BrandBlue); Spacer(Modifier.height(6.dp)); Text(answer, lineHeight = 21.sp) }
                 }
             }
             if (matches.isNotEmpty()) item { Text("Source meetings", fontWeight = FontWeight.Bold) }
@@ -607,18 +707,20 @@ private fun AskMai(db: MaiDb, revision: Int, onMeeting: (String) -> Unit) {
 }
 
 @Composable
-private fun Suggestion(text: String, onClick: () -> Unit) { OutlinedButton(onClick = onClick, modifier = Modifier.padding(end = 6.dp, bottom = 6.dp)) { Text(text) } }
+private fun Suggestion(text: String, onClick: () -> Unit) {
+    OutlinedButton(onClick = onClick, modifier = Modifier.padding(end = 6.dp, bottom = 6.dp)) { Text(text) }
+}
 
 private fun localAnswer(query: String, meetings: List<MeetingRecord>): String {
     if (meetings.isEmpty()) return "I couldn't find that in your saved meetings. Try a participant name, topic, decision, or action keyword."
     val q = query.lowercase()
     val lines = mutableListOf<String>()
-    meetings.forEach { m ->
-        m.decisions.filter { it.lowercase().contains(q) }.take(2).forEach { lines += "Decision — $it" }
-        m.actions.filter { it.text.lowercase().contains(q) || it.owner?.lowercase()?.contains(q) == true }.take(2).forEach { a ->
-            lines += "Action — ${a.text}${a.owner?.let { " · $it" } ?: ""}${a.due?.let { " · $it" } ?: ""}"
+    meetings.forEach { meeting ->
+        meeting.decisions.filter { it.lowercase().contains(q) }.take(2).forEach { lines += "Decision — $it" }
+        meeting.actions.filter { it.text.lowercase().contains(q) || it.owner?.lowercase()?.contains(q) == true }.take(2).forEach { action ->
+            lines += "Action — ${action.text}${action.owner?.let { " · $it" } ?: ""}${action.due?.let { " · $it" } ?: ""}"
         }
-        if (lines.size < 4 && m.summary.lowercase().contains(q)) lines += "${m.title} — ${m.summary}"
+        if (lines.size < 4 && meeting.summary.lowercase().contains(q)) lines += "${meeting.title} — ${meeting.summary}"
     }
     if (lines.isEmpty()) return "I found ${meetings.size} related meeting${if (meetings.size == 1) "" else "s"}. Open the source meetings below for the full context."
     return lines.distinct().take(6).joinToString("\n\n")
@@ -628,16 +730,19 @@ private fun localAnswer(query: String, meetings: List<MeetingRecord>): String {
 private fun SettingsPage(themeMode: Int, onTheme: (Int) -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("mai_settings", Context.MODE_PRIVATE) }
-    var retention by remember { mutableIntStateOf(prefs.getInt("audio_retention_days", 0)) }
+    var retention by remember { mutableIntStateOf(prefs.getInt("audio_retention_days", 7)) }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { BrandHeader(); Spacer(Modifier.height(18.dp)); Text("Settings", fontSize = 28.sp, fontWeight = FontWeight.Bold) }
         item {
             SettingsCard("Audio retention") {
                 Text("MOM, transcript, decisions and actions stay until you delete the meeting.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)); Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    listOf(0 to "Forever", 1 to "1 d", 7 to "7 d", 30 to "30 d").forEach { (days, label) ->
-                        if (retention == days) Button(onClick = {}, contentPadding = PaddingValues(horizontal = 9.dp)) { Text(label) }
-                        else OutlinedButton(onClick = { retention = days; prefs.edit().putInt("audio_retention_days", days).apply() }, contentPadding = PaddingValues(horizontal = 9.dp)) { Text(label) }
+                    listOf(0 to "Forever", 1 to "1 d", 7 to "7 d", 15 to "15 d", 30 to "30 d").forEach { (days, label) ->
+                        if (retention == days) {
+                            Button(onClick = {}, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label) }
+                        } else {
+                            OutlinedButton(onClick = { retention = days; prefs.edit().putInt("audio_retention_days", days).apply() }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text(label) }
+                        }
                     }
                 }
             }
@@ -651,13 +756,18 @@ private fun SettingsPage(themeMode: Int, onTheme: (Int) -> Unit) {
                 }
             }
         }
-        item { SettingsCard("Speech") { Text("Offline English live transcript", fontWeight = FontWeight.SemiBold); Text("Audio is always saved even when speech recognition is unavailable.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) } }
+        item { SettingsCard("Speech") { Text("Offline English live transcript", fontWeight = FontWeight.SemiBold); Text("STT runs separately from audio capture. Audio remains safe if transcription slows or fails.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) } }
+        item { SettingsCard("Recording safety") { Text("15-second recoverable audio chunks · screen-off foreground recording · storage monitoring · microphone interruption detection", fontSize = 12.sp) } }
         item { SettingsCard("Privacy") { Text("Meeting files and meeting memory are stored locally on this device in V1.", fontSize = 13.sp) } }
     }
 }
 
 @Composable
-private fun SettingsCard(title: String, content: @Composable () -> Unit) { Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) { Column(Modifier.padding(15.dp)) { Text(title, fontWeight = FontWeight.Bold); Spacer(Modifier.height(10.dp)); content() } } }
+private fun SettingsCard(title: String, content: @Composable () -> Unit) {
+    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) {
+        Column(Modifier.padding(15.dp)) { Text(title, fontWeight = FontWeight.Bold); Spacer(Modifier.height(10.dp)); content() }
+    }
+}
 
 @Composable
 private fun ThemeChoice(selected: Boolean, label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
@@ -691,13 +801,15 @@ private fun MeetingDetail(db: MaiDb, id: String, onBack: () -> Unit, onChanged: 
         Spacer(Modifier.height(10.dp))
         when (tab) {
             0 -> Mom(meeting, Modifier.weight(1f)) { index, done -> db.updateActionDone(meeting.id, index, done); revision++; onChanged() }
-            1 -> Card(Modifier.fillMaxWidth().weight(1f), shape = RoundedCornerShape(18.dp)) { LazyColumn(Modifier.padding(15.dp)) { item { Text(meeting.transcript.ifBlank { "No live transcript was available. Your saved audio may still contain the full meeting." }, lineHeight = 22.sp) } } }
+            1 -> Card(Modifier.fillMaxWidth().weight(1f), shape = RoundedCornerShape(18.dp)) {
+                LazyColumn(Modifier.padding(15.dp)) { item { Text(meeting.transcript.ifBlank { "No live transcript was available. Your saved audio may still contain the full meeting." }, lineHeight = 22.sp) } }
+            }
             else -> Audio(meeting, Modifier.weight(1f))
         }
         Spacer(Modifier.height(9.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton({ PdfShare.share(context, meeting) }, Modifier.weight(1f)) { Icon(Icons.Default.Share, null); Spacer(Modifier.width(5.dp)); Text("Share") }
-            Button({ PdfShare.shareToWhatsApp(context, meeting) }, Modifier.weight(1f)) { Text("WhatsApp PDF") }
+            OutlinedButton({ runCatching { PdfShare.share(context, meeting) } }, Modifier.weight(1f)) { Icon(Icons.Default.Share, null); Spacer(Modifier.width(5.dp)); Text("Share") }
+            Button({ runCatching { PdfShare.shareToWhatsApp(context, meeting) } }, Modifier.weight(1f)) { Text("WhatsApp PDF") }
         }
     }
 
@@ -718,54 +830,119 @@ private fun Mom(meeting: MeetingRecord, modifier: Modifier, onAction: (Int, Bool
         if (meeting.actions.isNotEmpty()) item {
             Card(shape = RoundedCornerShape(18.dp)) {
                 Column(Modifier.padding(15.dp)) {
-                    Text("Actions", fontWeight = FontWeight.Bold, color = BrandTeal); Spacer(Modifier.height(8.dp))
+                    Text("Actions", fontWeight = FontWeight.Bold, color = BrandBlue); Spacer(Modifier.height(8.dp))
                     meeting.actions.forEachIndexed { index, action ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton({ onAction(index, !action.done) }) { Icon(if (action.done) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked, null, tint = if (action.done) SafeGreen else BrandTeal) }
-                            Column(Modifier.weight(1f)) { Text(action.text, fontWeight = FontWeight.SemiBold); val meta = listOfNotNull(action.owner, action.due).joinToString(" · "); if (meta.isNotBlank()) Text(meta, fontSize = 12.sp, color = BrandTeal) }
+                            IconButton({ onAction(index, !action.done) }) {
+                                Icon(if (action.done) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked, null, tint = if (action.done) SafeGreen else BrandBlue)
+                            }
+                            Column(Modifier.weight(1f)) {
+                                Text(action.text, fontWeight = FontWeight.SemiBold)
+                                val meta = listOfNotNull(action.owner, action.due).joinToString(" · ")
+                                if (meta.isNotBlank()) Text(meta, fontSize = 12.sp, color = BrandBlue)
+                            }
                         }
                         if (index < meeting.actions.lastIndex) HorizontalDivider()
                     }
                 }
             }
         }
-        item { Card(shape = RoundedCornerShape(18.dp)) { Column(Modifier.padding(15.dp)) { Text("Participants", fontWeight = FontWeight.Bold); Spacer(Modifier.height(7.dp)); meeting.participants.forEach { Text("${it.name} · ${it.phone}") } } } }
-    }
-}
-
-@Composable
-private fun Section(title: String, lines: List<String>) { Card(shape = RoundedCornerShape(18.dp)) { Column(Modifier.padding(15.dp)) { Text(title, fontWeight = FontWeight.Bold, color = BrandTeal); Spacer(Modifier.height(7.dp)); lines.filter(String::isNotBlank).forEach { line -> Text(if (lines.size > 1) "• $line" else line, lineHeight = 21.sp) } } } }
-
-@Composable
-private fun Audio(meeting: MeetingRecord, modifier: Modifier) {
-    val path = meeting.audioPath
-    var player by remember { mutableStateOf<MediaPlayer?>(null) }
-    var playing by remember { mutableStateOf(false) }
-    DisposableEffect(path) { onDispose { runCatching { player?.release() } } }
-    Card(modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) {
-        Column(Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-            if (path == null || !File(path).exists()) { Icon(Icons.Default.DeleteOutline, null, Modifier.size(52.dp), tint = MaterialTheme.colorScheme.onSurface.copy(alpha = .3f)); Spacer(Modifier.height(8.dp)); Text("Audio not available") }
-            else {
-                Icon(Icons.Default.Mic, null, Modifier.size(56.dp), tint = BrandTeal); Spacer(Modifier.height(12.dp))
-                FilledTonalButton(onClick = {
-                    if (playing) { player?.pause(); playing = false }
-                    else {
-                        if (player == null) player = MediaPlayer().apply { setDataSource(path); prepare(); setOnCompletionListener { playing = false } }
-                        player?.start(); playing = true
-                    }
-                }) { Icon(if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, null); Spacer(Modifier.width(6.dp)); Text(if (playing) "Pause" else "Play") }
+        item {
+            Card(shape = RoundedCornerShape(18.dp)) {
+                Column(Modifier.padding(15.dp)) {
+                    Text("Participants", fontWeight = FontWeight.Bold); Spacer(Modifier.height(7.dp))
+                    meeting.participants.forEach { Text("${it.name} · ${it.phone}") }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun BackHeader(title: String, onBack: () -> Unit) { Row(verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }; Text(title, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis) } }
+private fun Section(title: String, lines: List<String>) {
+    Card(shape = RoundedCornerShape(18.dp)) {
+        Column(Modifier.padding(15.dp)) {
+            Text(title, fontWeight = FontWeight.Bold, color = BrandBlue); Spacer(Modifier.height(7.dp))
+            lines.filter(String::isNotBlank).forEach { line -> Text(if (lines.size > 1) "• $line" else line, lineHeight = 21.sp) }
+        }
+    }
+}
 
 @Composable
-private fun Empty(text: String) { Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) { Text(text, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .45f)) } }
+private fun Audio(meeting: MeetingRecord, modifier: Modifier) {
+    val path = meeting.audioPath
+    var player by remember { mutableStateOf<MediaPlayer?>(null) }
+    var playing by remember { mutableStateOf(false) }
+    var playbackError by remember { mutableStateOf<String?>(null) }
+    DisposableEffect(path) {
+        onDispose {
+            runCatching { player?.stop() }
+            runCatching { player?.release() }
+            player = null
+        }
+    }
+    Card(modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) {
+        Column(Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            if (path == null || !File(path).isFile) {
+                Icon(Icons.Default.DeleteOutline, null, Modifier.size(52.dp), tint = MaterialTheme.colorScheme.onSurface.copy(alpha = .3f)); Spacer(Modifier.height(8.dp)); Text("Audio not available")
+            } else {
+                Icon(Icons.Default.Mic, null, Modifier.size(56.dp), tint = BrandBlue); Spacer(Modifier.height(12.dp))
+                FilledTonalButton(onClick = {
+                    playbackError = null
+                    if (playing) {
+                        runCatching { player?.pause() }.onFailure { playbackError = "Unable to pause audio." }
+                        playing = false
+                    } else {
+                        runCatching {
+                            if (player == null) {
+                                player = MediaPlayer().apply {
+                                    setDataSource(path)
+                                    setOnCompletionListener { playing = false }
+                                    setOnErrorListener { _, _, _ ->
+                                        playing = false
+                                        playbackError = "This audio file could not be played. The MOM and transcript remain safe."
+                                        true
+                                    }
+                                    prepare()
+                                }
+                            }
+                            player?.start()
+                            playing = true
+                        }.onFailure {
+                            runCatching { player?.release() }
+                            player = null
+                            playing = false
+                            playbackError = "This audio file could not be played. The MOM and transcript remain safe."
+                        }
+                    }
+                }) {
+                    Icon(if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, null); Spacer(Modifier.width(6.dp)); Text(if (playing) "Pause" else "Play")
+                }
+                playbackError?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackHeader(title: String, onBack: () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }
+        Text(title, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+private fun Empty(text: String) {
+    Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
+        Text(text, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .45f))
+    }
+}
 
 private fun formatElapsed(ms: Long): String {
-    val total = ms / 1000; val hours = total / 3600; val minutes = (total % 3600) / 60; val seconds = total % 60
+    val total = ms / 1000
+    val hours = total / 3600
+    val minutes = (total % 3600) / 60
+    val seconds = total % 60
     return if (hours > 0) "%02d:%02d:%02d".format(hours, minutes, seconds) else "%02d:%02d".format(minutes, seconds)
 }
