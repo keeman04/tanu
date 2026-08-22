@@ -69,7 +69,7 @@ class RealtimeSecretResponse(BaseModel):
 
 def require_auth(authorization: str | None) -> None:
     if not MAI_GATEWAY_TOKEN:
-        return
+        raise HTTPException(status_code=503, detail="MAI_GATEWAY_TOKEN is not configured")
     if authorization != f"Bearer {MAI_GATEWAY_TOKEN}":
         raise HTTPException(status_code=401, detail="Invalid MAI gateway token")
 
@@ -475,6 +475,7 @@ def health() -> dict[str, Any]:
     return {
         "ok": True,
         "openai_configured": bool(OPENAI_API_KEY),
+        "gateway_auth_configured": bool(MAI_GATEWAY_TOKEN),
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "stt_model": STT_MODEL,
         "diarize_model": DIARIZE_MODEL,
