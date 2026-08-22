@@ -40,6 +40,13 @@ class AacAdtsSink(file: File, private val sampleRate: Int = 16000, private val c
         }
     }
 
+    fun checkpoint() {
+        if (closed) return
+        drain(false)
+        out.flush()
+        runCatching { out.fd.sync() }
+    }
+
     private fun drain(end: Boolean) {
         val info = MediaCodec.BufferInfo()
         while (true) {

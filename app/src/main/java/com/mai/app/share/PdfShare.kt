@@ -2,6 +2,7 @@ package com.mai.app.share
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.pdf.PdfDocument
 import androidx.core.content.FileProvider
@@ -13,50 +14,112 @@ import java.util.Date
 
 object PdfShare {
     fun share(context: Context, meeting: MeetingRecord) {
+        val (file, uri) = prepare(context, meeting)
+        context.startActivity(Intent.createChooser(sendIntent(uri, meeting), "Share MAI MOM"))
+    }
+
+    fun shareToWhatsApp(context: Context, meeting: MeetingRecord) {
+        val (_, uri) = prepare(context, meeting)
+        val intent = sendIntent(uri, meeting).setPackage("com.whatsapp")
+        if (intent.resolveActivity(context.packageManager) != null) {
+            context.startActivity(intent)
+        } else {
+            context.startActivity(Intent.createChooser(sendIntent(uri, meeting), "Share MAI MOM"))
+        }
+    }
+
+    private fun prepare(context: Context, meeting: MeetingRecord): Pair<File, android.net.Uri> {
         val dir = File(context.cacheDir, "shared").apply { mkdirs() }
-        val file = File(dir, "MAI-${meeting.id.take(8)}.pdf")
+        val safe = meeting.title.replace(Regex("[^A-Za-z0-9_-]+"), "-").trim('-').take(36).ifBlank { meeting.id.take(8) }
+        val file = File(dir, "MAI-$safe.pdf")
         create(file, meeting)
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
-        context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-            type = "application/pdf"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }, "Share MOM"))
+        return file to uri
+    }
+
+    private fun sendIntent(uri: android.net.Uri, meeting: MeetingRecord) = Intent(Intent.ACTION_SEND).apply {
+        type = "application/pdf"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_SUBJECT, "MAI MOM · ${meeting.title}")
+        putExtra(Intent.EXTRA_TEXT, "MAI MOM · ${meeting.title}\n${DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(meeting.startedAt))}")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
 
     private fun create(file: File, meeting: MeetingRecord) {
         val doc = PdfDocument()
-        val page = doc.startPage(PdfDocument.PageInfo.Builder(595, 842, 1).create())
-        val c = page.canvas
-        val title = Paint().apply { textSize = 22f; isFakeBoldText = true }
-        val h = Paint().apply { textSize = 13f; isFakeBoldText = true }
-        val body = Paint().apply { textSize = 11f }
-        var y = 55f
-        c.drawText("MAI · ${meeting.title}", 42f, y, title); y += 24
-        c.drawText(DateFormat.getDateTimeInstance().format(Date(meeting.startedAt)), 42f, y, body); y += 30
-        fun section(name: String, lines: List<String>) {
-            if (lines.isEmpty()) return
-            c.drawText(name, 42f, y, h); y += 18
-            lines.forEach { line ->
-                wrap(line, 82).forEach { part -> c.drawText("• $part", 48f, y, body); y += 15 }
+        val title = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 22f; isFakeBoldText = true }
+        val h = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 13f; isFakeBoldText = true }
+        val body = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 11f }
+        val muted = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 9.5f; alpha = 160 }
+
+        var pageNumber = 0
+        var page: PdfDocument.Page? = null
+        var canvas: Canvas? = null
+        var y = 0f
+
+        fun newPage() {
+            page?.let { doc.finishPage(it) }
+            pageNumber++
+            page = doc.startPage(PdfDocument.PageInfo.Builder(595, 842, pageNumber).create())
+            canvas = page!!.canvas
+            y = 52f
+            if (pageNumber > 1) {
+                canvas!!.drawText("MAI · ${meeting.title}", 42f, y, h)
+                y += 28f
             }
-            y += 10
         }
+
+        fun ensure(height: Float) { if (y + height > 790f) newPage() }
+        fun line(text: String, paint: Paint = body, x: Float = 48f, bullet: Boolean = false) {
+            val parts = wrap(text, if (bullet) 78 else 84)
+            parts.forEachIndexed { index, part ->
+                ensure(17f)
+                canvas!!.drawText(if (bullet && index == 0) "• $part" else if (bullet) "  $part" else part, x, y, paint)
+                y += 15f
+            }
+        }
+        fun section(name: String, lines: List<String>) {
+            val clean = lines.filter { it.isNotBlank() }
+            if (clean.isEmpty()) return
+            ensure(30f)
+            canvas!!.drawText(name, 42f, y, h); y += 18f
+            clean.forEach { line(it, body, 48f, true) }
+            y += 9f
+        }
+
+        newPage()
+        canvas!!.drawText("MAI · ${meeting.title}", 42f, y, title); y += 25f
+        canvas!!.drawText(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(meeting.startedAt)), 42f, y, muted); y += 19f
+        val people = meeting.participants.joinToString(", ") { it.name }
+        if (people.isNotBlank()) { line("Participants: $people", muted, 42f); y += 10f }
+
         section("SUMMARY", listOf(meeting.summary))
         section("DECISIONS", meeting.decisions)
-        section("ACTIONS", meeting.actions.map { a -> listOfNotNull(a.text, a.owner?.let { "Owner: $it" }, a.due?.let { "Due: $it" }).joinToString(" · ") })
-        doc.finishPage(page)
+        section("ACTIONS", meeting.actions.map { a ->
+            buildList {
+                add(if (a.done) "✓ ${a.text}" else a.text)
+                a.owner?.let { add("Owner: $it") }
+                a.due?.let { add("Due: $it") }
+            }.joinToString(" · ")
+        })
+
+        ensure(28f)
+        canvas!!.drawText("Generated by MAI · Meeting Assistant Intelligence", 42f, y + 10f, muted)
+        page?.let { doc.finishPage(it) }
         FileOutputStream(file).use { doc.writeTo(it) }
         doc.close()
     }
 
     private fun wrap(text: String, max: Int): List<String> {
         if (text.length <= max) return listOf(text)
-        val words = text.split(' ')
-        val out = mutableListOf<String>(); var current = ""
-        words.forEach { w ->
-            val next = if (current.isBlank()) w else "$current $w"
-            if (next.length > max) { if (current.isNotBlank()) out += current; current = w } else current = next
+        val out = mutableListOf<String>()
+        var current = ""
+        text.split(Regex("\\s+")).forEach { word ->
+            val next = if (current.isBlank()) word else "$current $word"
+            if (next.length > max) {
+                if (current.isNotBlank()) out += current
+                current = word
+            } else current = next
         }
         if (current.isNotBlank()) out += current
         return out

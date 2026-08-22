@@ -3,6 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+fun quotedBuildValue(value: String): String = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
 android {
     namespace = "com.mai.app"
     compileSdk = 35
@@ -11,10 +13,12 @@ android {
         applicationId = "com.mai.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
+        versionCode = 5
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
+        buildConfigField("String", "MAI_BACKEND_URL", quotedBuildValue(providers.gradleProperty("MAI_BACKEND_URL").orElse("").get()))
+        buildConfigField("String", "MAI_GATEWAY_TOKEN", quotedBuildValue(providers.gradleProperty("MAI_GATEWAY_TOKEN").orElse("").get()))
     }
 
     buildTypes {
@@ -29,7 +33,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     packaging {
         resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}")
@@ -52,8 +56,11 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    implementation("com.alphacephei:vosk-android:0.3.38")
+    implementation("com.alphacephei:vosk-android:0.3.75")
     implementation("com.alphacephei:vosk-model-en:0.3.38")
 
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:core-ktx:1.6.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }
