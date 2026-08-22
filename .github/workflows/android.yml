@@ -29,10 +29,34 @@ jobs:
         run: gradle --no-daemon testDebugUnitTest
       - name: Build APK
         run: gradle --no-daemon assembleDebug
+      - name: Validate 16 KiB arm64 native alignment
+        run: |
+          rm -rf /tmp/mai-apk-check
+          mkdir -p /tmp/mai-apk-check
+          unzip -q app/build/outputs/apk/debug/app-debug.apk 'lib/arm64-v8a/*.so' -d /tmp/mai-apk-check
+          python3 - <<'PY'
+          import glob, subprocess, sys
+          bad = []
+          for path in glob.glob('/tmp/mai-apk-check/lib/arm64-v8a/*.so'):
+              text = subprocess.check_output(['readelf', '-lW', path], text=True)
+              for line in text.splitlines():
+                  parts = line.split()
+                  if parts and parts[0] == 'LOAD':
+                      align = int(parts[-1], 16)
+                      if align < 0x4000:
+                          bad.append((path, hex(align)))
+                          break
+          if bad:
+              print('Native libraries not 16 KiB aligned:')
+              for path, align in bad:
+                  print(f'  {path}: {align}')
+              sys.exit(1)
+          print('All arm64 native LOAD segments are at least 16 KiB aligned.')
+          PY
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.1.0-RC1-Android
+          name: MAI-V1.1.0-RC2-Android
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
           if-no-files-found: error
