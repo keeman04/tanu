@@ -72,7 +72,12 @@ class AiEnhanceWorker(appContext: Context, params: WorkerParameters) : Coroutine
         val sessionToken = try {
             auth.sessionToken()
         } catch (_: Throwable) {
+            val stillActivated = auth.isActivated()
             auth.close()
+            if (stillActivated && runAttemptCount < 4) {
+                db.updateStatus(id, "processing", "MAI authentication service is temporarily unavailable and will retry automatically.")
+                return@withContext Result.retry()
+            }
             db.updateStatus(
                 id,
                 "recorded",
