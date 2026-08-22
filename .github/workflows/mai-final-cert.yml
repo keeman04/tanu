@@ -40,7 +40,7 @@ jobs:
           token = os.environ['MAI_GATEWAY_TOKEN']
           with urllib.request.urlopen(base + '/health', timeout=20) as response:
               health = json.load(response)
-          if not health.get('ok') or not health.get('openai_configured') or not health.get('ffmpeg'):
+          if not health.get('ok') or not health.get('openai_configured') or not health.get('gateway_auth_configured') or not health.get('ffmpeg'):
               raise SystemExit(f'Backend health is not production-ready: {health}')
           body = json.dumps({'participants': ['MAI Certification']}).encode()
           request = urllib.request.Request(
