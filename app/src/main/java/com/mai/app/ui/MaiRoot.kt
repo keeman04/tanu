@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -555,59 +556,65 @@ private fun normalizePhone(value: String): String = value.filter { it.isDigit() 
 
 @Composable
 private fun RecordingPage(state: RecordingSnapshot, onStop: () -> Unit, onExit: () -> Unit) {
+    val transcriptListState = rememberLazyListState()
+    val liveLines = remember(state.transcript, state.partial) {
+        buildList {
+  state.transcript.lineSequence().map(String::trim).filter(String::isNotBlank).forEach { add(it) }
+  state.partial.trim().takeIf(String::isNotBlank)?.let { add(it) }
+        }
+    }
+    LaunchedEffect(liveLines.size, state.partial) {
+        if (liveLines.isNotEmpty()) transcriptListState.animateScrollToItem(liveLines.lastIndex + 1)
+    }
+
     Column(Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         BrandHeader(); Spacer(Modifier.height(30.dp))
         Text(formatElapsed(state.elapsedMs), fontSize = 44.sp, fontWeight = FontWeight.Light)
         Spacer(Modifier.height(18.dp))
         VolumeWaveform(state.levels, Modifier.fillMaxWidth().height(120.dp))
         Text(
-            when (state.status) {
-                "interrupted" -> "Microphone interrupted"
-                "reconnecting" -> "Reconnecting microphone"
-                else -> if (state.level <= 0f) "Listening" else "Voice detected"
-            },
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = .55f)
+  when (state.status) {
+      "interrupted" -> "Microphone interrupted"
+      "reconnecting" -> "Reconnecting microphone"
+      "finalizing" -> "Finalizing audio safely"
+      else -> if (state.level <= 0f) "Listening" else "Voice detected"
+  },
+  color = MaterialTheme.colorScheme.onSurface.copy(alpha = .55f)
         )
         Spacer(Modifier.height(14.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusChip(if (state.active) "Recording" else "Stopped", if (state.active) BrandBlue else WarningAmber)
-            StatusChip(if (state.audioSafe) "Audio checkpointed" else "Securing audio", if (state.audioSafe) SafeGreen else WarningAmber)
+  StatusChip(if (state.active) "Recording" else if (state.status == "finalizing") "Finalizing" else "Stopped", if (state.active) BrandBlue else WarningAmber)
+  StatusChip(if (state.audioSafe) "Audio checkpointed" else "Securing audio", if (state.audioSafe) SafeGreen else WarningAmber)
         }
         state.interruption?.let { Text(it, color = WarningAmber, fontSize = 12.sp, modifier = Modifier.padding(top = 9.dp)) }
         state.storageWarning?.let { Text(it, color = WarningAmber, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp)) }
         state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp)) }
         Spacer(Modifier.height(14.dp))
         Card(Modifier.fillMaxWidth().weight(1f), shape = RoundedCornerShape(20.dp)) {
-            LazyColumn(Modifier.padding(17.dp)) {
-                item { Text("Live transcript", fontWeight = FontWeight.Bold); Spacer(Modifier.height(8.dp)) }
-                item {
-                    val text = buildString {
-                        append(state.transcript)
-                        if (state.partial.isNotBlank()) {
-                            if (isNotBlank()) append('\n')
-                            append(state.partial)
-                        }
-                    }
-                    Text(text.ifBlank { "MAI is recording. Audio remains the source of truth even when live transcription is unavailable." }, lineHeight = 22.sp)
-                }
-            }
+  LazyColumn(state = transcriptListState, modifier = Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+      item { Text("Live transcript", fontWeight = FontWeight.Bold); Spacer(Modifier.height(3.dp)) }
+      if (liveLines.isEmpty()) {
+          item { Text("MAI is recording. Audio remains the source of truth even when live transcription is unavailable.", lineHeight = 22.sp) }
+      } else {
+          items(liveLines) { line -> Text(line, lineHeight = 22.sp) }
+      }
+  }
         }
         Spacer(Modifier.height(12.dp))
         if (state.active) {
-            Button(
-                onClick = onStop,
-                modifier = Modifier.fillMaxWidth().height(58.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB5273E)),
-                shape = RoundedCornerShape(18.dp)
-            ) {
-                Icon(Icons.Default.Stop, null); Spacer(Modifier.width(8.dp)); Text("Stop meeting", fontWeight = FontWeight.Bold)
-            }
+  Button(
+      onClick = onStop,
+      modifier = Modifier.fillMaxWidth().height(58.dp),
+      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB5273E)),
+      shape = RoundedCornerShape(18.dp)
+  ) {
+      Icon(Icons.Default.Stop, null); Spacer(Modifier.width(8.dp)); Text("Stop meeting", fontWeight = FontWeight.Bold)
+  }
         } else if (state.error != null) {
-            Button(onClick = onExit, modifier = Modifier.fillMaxWidth().height(54.dp)) { Text("Back to Home") }
+  Button(onClick = onExit, modifier = Modifier.fillMaxWidth().height(54.dp)) { Text("Back to Home") }
         }
     }
 }
-
 @Composable
 private fun VolumeWaveform(levels: List<Float>, modifier: Modifier) {
     Canvas(modifier) {
@@ -756,9 +763,9 @@ private fun SettingsPage(themeMode: Int, onTheme: (Int) -> Unit) {
                 }
             }
         }
-        item { SettingsCard("Speech") { Text("Offline English live transcript", fontWeight = FontWeight.SemiBold); Text("STT runs separately from audio capture. Audio remains safe if transcription slows or fails.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) } }
+        item { SettingsCard("Speech & AI") { Text("Realtime Tamil + English/Tanglish preview", fontWeight = FontWeight.SemiBold); Text("Live transcription is only a preview. The complete saved audio is reprocessed after Stop for the final English transcript and MOM.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) } }
         item { SettingsCard("Recording safety") { Text("15-second recoverable audio chunks · screen-off foreground recording · storage monitoring · microphone interruption detection", fontSize = 12.sp) } }
-        item { SettingsCard("Privacy") { Text("Meeting files and meeting memory are stored locally on this device in V1.", fontSize = 13.sp) } }
+        item { SettingsCard("Privacy") { Text("Original audio is protected locally on this device. When AI processing is configured, meeting audio is sent over HTTPS to the MAI backend for transcription and MOM generation. The permanent OpenAI API key is never stored in the app.", fontSize = 13.sp) } }
     }
 }
 
@@ -784,32 +791,72 @@ private fun MeetingDetail(db: MaiDb, id: String, onBack: () -> Unit, onChanged: 
     var deleteOpen by remember { mutableStateOf(false) }
     if (meeting == null) { Empty("Meeting unavailable"); return }
 
+    LaunchedEffect(id, meeting.status) {
+        if (meeting.status in setOf("processing", "recorded")) {
+  var lastStatus = meeting.status
+  var lastSummary = meeting.summary
+  var lastTranscript = meeting.transcript
+  while (true) {
+      delay(1000)
+      val latest = withContext(Dispatchers.IO) { db.getMeeting(id) } ?: break
+      if (latest.status != lastStatus || latest.summary != lastSummary || latest.transcript != lastTranscript) {
+          lastStatus = latest.status
+          lastSummary = latest.summary
+          lastTranscript = latest.transcript
+          revision++
+      }
+      if (latest.status !in setOf("processing", "recorded")) break
+  }
+        }
+    }
+
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }
-            Text(meeting.title, fontSize = 21.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-            IconButton({ deleteOpen = true }) { Icon(Icons.Default.DeleteOutline, null) }
+  IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) }
+  Text(meeting.title, fontSize = 21.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+  IconButton({ deleteOpen = true }) { Icon(Icons.Default.DeleteOutline, null) }
         }
         Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(meeting.startedAt)), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f))
+        if (meeting.status != "ready") {
+  Spacer(Modifier.height(8.dp))
+  val statusText = when (meeting.status) {
+      "processing" -> "Processing full recording"
+      "recorded" -> "Audio saved - waiting for AI"
+      "processing_failed" -> "Processing failed - audio preserved"
+      "interrupted" -> "Interrupted meeting recovered"
+      else -> meeting.status.replace('_', ' ').replaceFirstChar { it.uppercase() }
+  }
+  val statusColor = if (meeting.status == "processing_failed") MaterialTheme.colorScheme.error else WarningAmber
+  StatusChip(statusText, statusColor)
+        }
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            listOf("MOM", "Transcript", "Audio").forEachIndexed { index, label ->
-                if (tab == index) Button({ tab = index }, contentPadding = PaddingValues(horizontal = 11.dp)) { Text(label) }
-                else OutlinedButton({ tab = index }, contentPadding = PaddingValues(horizontal = 11.dp)) { Text(label) }
-            }
+  listOf("MOM", "Transcript", "Audio").forEachIndexed { index, label ->
+      if (tab == index) Button({ tab = index }, contentPadding = PaddingValues(horizontal = 11.dp)) { Text(label) }
+      else OutlinedButton({ tab = index }, contentPadding = PaddingValues(horizontal = 11.dp)) { Text(label) }
+  }
         }
         Spacer(Modifier.height(10.dp))
         when (tab) {
-            0 -> Mom(meeting, Modifier.weight(1f)) { index, done -> db.updateActionDone(meeting.id, index, done); revision++; onChanged() }
-            1 -> Card(Modifier.fillMaxWidth().weight(1f), shape = RoundedCornerShape(18.dp)) {
-                LazyColumn(Modifier.padding(15.dp)) { item { Text(meeting.transcript.ifBlank { "No live transcript was available. Your saved audio may still contain the full meeting." }, lineHeight = 22.sp) } }
-            }
-            else -> Audio(meeting, Modifier.weight(1f))
+  0 -> Mom(meeting, Modifier.weight(1f)) { index, done -> db.updateActionDone(meeting.id, index, done); revision++; onChanged() }
+  1 -> Card(Modifier.fillMaxWidth().weight(1f), shape = RoundedCornerShape(18.dp)) {
+      LazyColumn(Modifier.padding(15.dp)) {
+          item {
+              Text(
+                  meeting.transcript.ifBlank {
+                      if (meeting.status in setOf("processing", "recorded")) "Final transcript is being prepared from the complete saved audio." else "No transcript is available."
+                  },
+                  lineHeight = 22.sp
+              )
+          }
+      }
+  }
+  else -> Audio(meeting, Modifier.weight(1f))
         }
         Spacer(Modifier.height(9.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton({ runCatching { PdfShare.share(context, meeting) } }, Modifier.weight(1f)) { Icon(Icons.Default.Share, null); Spacer(Modifier.width(5.dp)); Text("Share") }
-            Button({ runCatching { PdfShare.shareToWhatsApp(context, meeting) } }, Modifier.weight(1f)) { Text("WhatsApp PDF") }
+  OutlinedButton({ runCatching { PdfShare.share(context, meeting) } }, Modifier.weight(1f), enabled = meeting.status == "ready") { Icon(Icons.Default.Share, null); Spacer(Modifier.width(5.dp)); Text("Share") }
+  Button({ runCatching { PdfShare.shareToWhatsApp(context, meeting) } }, Modifier.weight(1f), enabled = meeting.status == "ready") { Text("WhatsApp PDF") }
         }
     }
 
@@ -821,7 +868,6 @@ private fun MeetingDetail(db: MaiDb, id: String, onBack: () -> Unit, onChanged: 
         dismissButton = { TextButton({ deleteOpen = false }) { Text("Cancel") } }
     )
 }
-
 @Composable
 private fun Mom(meeting: MeetingRecord, modifier: Modifier, onAction: (Int, Boolean) -> Unit) {
     LazyColumn(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
