@@ -72,8 +72,8 @@ class RecoverableAudioWriter(
             var offset = 0
             var written = 0L
             while (offset + 7 <= data.size) {
-                val sync = data[offset].toInt() and 0xFF == 0xFF &&
-                    data[offset + 1].toInt() and 0xF0 == 0xF0
+                val sync = ((data[offset].toInt() and 0xFF) == 0xFF) &&
+                    ((data[offset + 1].toInt() and 0xF0) == 0xF0)
                 if (!sync) {
                     offset++
                     continue
