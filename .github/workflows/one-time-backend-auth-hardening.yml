@@ -1,0 +1,38 @@
+name: One-time MAI backend auth hardening
+on:
+  push:
+    branches: [ mai-v1.1-tamil ]
+permissions:
+  contents: write
+jobs:
+  patch-auth:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mai-v1.1-tamil
+      - name: Make backend authentication fail closed
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('backend/app.py')
+          text = path.read_text()
+          old = '''def require_auth(authorization: str | None) -> None:\n    if not MAI_GATEWAY_TOKEN:\n        return\n    if authorization != f"Bearer {MAI_GATEWAY_TOKEN}":\n        raise HTTPException(status_code=401, detail="Invalid MAI gateway token")\n'''
+          new = '''def require_auth(authorization: str | None) -> None:\n    if not MAI_GATEWAY_TOKEN:\n        raise HTTPException(status_code=503, detail="MAI_GATEWAY_TOKEN is not configured")\n    if authorization != f"Bearer {MAI_GATEWAY_TOKEN}":\n        raise HTTPException(status_code=401, detail="Invalid MAI gateway token")\n'''
+          if old not in text:
+              raise SystemExit('require_auth marker not found')
+          text = text.replace(old, new, 1)
+          marker = '        "openai_configured": bool(OPENAI_API_KEY),\n'
+          if marker not in text:
+              raise SystemExit('health marker not found')
+          text = text.replace(marker, marker + '        "gateway_auth_configured": bool(MAI_GATEWAY_TOKEN),\n', 1)
+          path.write_text(text)
+          PY
+      - name: Commit backend auth hardening
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/app.py
+          git commit -m "Fail closed when MAI gateway authentication is missing"
+          git push origin HEAD:mai-v1.1-tamil
