@@ -15,6 +15,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.Process
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -28,8 +29,6 @@ import com.mai.app.R
 import com.mai.app.data.MaiDb
 import com.mai.app.intelligence.AiEnhanceWorker
 import com.mai.app.intelligence.MomEngine
-import org.json.JSONObject
-import org.vosk.Recognizer
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -43,10 +42,12 @@ class RecordingService : Service() {
         const val EXTRA_MEETING_ID = "meeting_id"
         private const val CHANNEL = "mai_recording"
         private const val NOTIFICATION_ID = 1001
-        private const val SAMPLE_RATE = 16000
-        private const val CHECKPOINT_MS = 10_000L
+        private const val SAMPLE_RATE = 16_000
+        private const val CHECKPOINT_MS = 5_000L
+        private const val STORAGE_CHECK_MS = 10_000L
         private const val UI_UPDATE_MS = 100L
         private const val NOTIFICATION_UPDATE_MS = 1_000L
+        private const val MAX_RECONNECT_ATTEMPTS = 3
     }
 
     private val running = AtomicBoolean(false)
@@ -86,8 +87,8 @@ class RecordingService : Service() {
             stopSelf()
             return
         }
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            RecordingBus.update { it.copy(active = false, status = "error", error = "Microphone permission missing") }
+        RecordingPreflight.blockingIssue(this)?.let { issue ->
+            RecordingBus.update { it.copy(active = false, meetingId = id, status = "error", error = issue) }
             stopSelf()
             return
         }
@@ -118,93 +119,110 @@ class RecordingService : Service() {
             try {
                 captureLoop(id)
             } catch (t: Throwable) {
-                RecordingBus.update { it.copy(error = t.message ?: "Recording error", status = "error") }
-                finalizeMeeting(id, File(File(filesDir, "audio"), "$id.aac"), "", t)
+                // Last-resort boundary: recover closed/checkpointed chunks even if an
+                // unexpected programming/OEM exception escapes the normal capture path.
+                val recovered = runCatching { RecoverableAudioWriter.recover(this, id) }.getOrNull()
+                val transcript = runCatching { MaiDb(this).getMeeting(id)?.transcript.orEmpty() }.getOrDefault("")
+                finalizeMeeting(id, recovered, transcript, t)
             }
         }, "mai-audio").apply {
             uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error ->
-                RecordingBus.update { it.copy(active = false, status = "error", error = error.message ?: "Recording thread failed") }
+                RecordingBus.update {
+                    it.copy(active = false, status = "error", error = error.message ?: "Recording thread failed")
+                }
             }
             start()
         }
     }
 
     private fun captureLoop(id: String) {
-        val output = File(File(filesDir, "audio").apply { mkdirs() }, "$id.aac")
-        var db: MaiDb? = null
+        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) }
+
+        val db = MaiDb(this)
+        val baseTranscript = db.getMeeting(id)?.transcript.orEmpty().trim()
         var audio: AudioRecord? = null
-        var sink: AacAdtsSink? = null
-        var recognizer: Recognizer? = null
-        var transcript = StringBuilder()
+        var buffer = ByteArray(8192)
+        var health: MicHealthMonitor? = null
+        var writer: RecoverableAudioWriter? = null
+        var transcriber: SpeechTranscriber? = null
         var recordingFailure: Throwable? = null
         var lastCheckpoint = 0L
+        var lastStorageCheck = 0L
         var lastUi = 0L
         var lastNotification = 0L
         var lastGoodRead = 0L
-        var speechLoadRequested = false
         var consecutiveReadErrors = 0
+        var storageWarning: String? = null
+
+        fun combinedTranscript(): String {
+            val live = transcriber?.transcript().orEmpty().trim()
+            return listOf(baseTranscript, live).filter { it.isNotBlank() }.joinToString("\n")
+        }
+
+        fun installHealthMonitor(recorder: AudioRecord): MicHealthMonitor = MicHealthMonitor(this, recorder) { message, silenced ->
+            RecordingBus.update { old ->
+                old.copy(
+                    interruption = message,
+                    audioSafe = if (silenced) false else old.audioSafe,
+                    status = if (silenced) "interrupted" else if (old.active) "recording" else old.status
+                )
+            }
+        }
 
         try {
-            db = MaiDb(this)
-            transcript = StringBuilder(db.getMeeting(id)?.transcript.orEmpty())
+            writer = RecoverableAudioWriter(this, id, SAMPLE_RATE)
+            transcriber = SpeechTranscriber(
+                context = this,
+                sampleRate = SAMPLE_RATE,
+                onUpdate = { transcript, partial ->
+                    val text = listOf(baseTranscript, transcript.trim()).filter { it.isNotBlank() }.joinToString("\n")
+                    RecordingBus.update { old -> old.copy(transcript = text, partial = partial) }
+                },
+                onWarning = { warning ->
+                    RecordingBus.update { old -> old.copy(interruption = warning) }
+                }
+            )
 
-            val created = createAudioRecord()
-            audio = created.first
-            val bufferSize = created.second
+            val opened = openMicrophone()
+            audio = opened.first
+            buffer = ByteArray(opened.second)
             activeAudio = audio
-
-            sink = AacAdtsSink(output)
-            audio.startRecording()
-            if (audio.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                throw IllegalStateException("Microphone did not enter recording state")
-            }
-
-            val buffer = ByteArray(bufferSize)
+            health = installHealthMonitor(audio)
             RecordingBus.update { it.copy(active = true, status = "recording", error = null) }
 
             while (running.get()) {
-                val read = audio.read(buffer, 0, buffer.size)
+                val currentAudio = audio ?: throw IOException("Microphone unavailable")
+                val read = currentAudio.read(buffer, 0, buffer.size)
                 if (read > 0) {
                     consecutiveReadErrors = 0
                     val now = System.currentTimeMillis()
                     lastGoodRead = now
-                    sink.writePcm(buffer, read)
+                    writer.writePcm(buffer, read)
+                    transcriber.offer(buffer, read)
 
-                    if (!speechLoadRequested) {
-                        speechLoadRequested = true
-                        runCatching { SpeechModelHolder.ensureForRecording(this) }
-                    }
-
-                    if (recognizer == null) {
-                        SpeechModelHolder.model?.let { loadedModel ->
-                            recognizer = runCatching {
-                                Recognizer(loadedModel, SAMPLE_RATE.toFloat()).apply { setWords(true) }
-                            }.getOrNull()
-                        }
-                    }
-
-                    val level = normalize(rms(buffer, read))
-                    var partial = ""
-                    recognizer?.let { r ->
-                        val accepted = runCatching { r.acceptWaveForm(buffer, read) }.getOrDefault(false)
-                        if (accepted) {
-                            val text = runCatching { JSONObject(r.result).optString("text").trim() }.getOrDefault("")
-                            if (text.isNotBlank()) {
-                                if (transcript.isNotEmpty()) transcript.append('\n')
-                                transcript.append(text)
-                            }
-                        } else {
-                            partial = runCatching { JSONObject(r.partialResult).optString("partial").trim() }.getOrDefault("")
-                        }
+                    health?.pollRouteChange()?.let { routeEvent ->
+                        RecordingBus.update { old -> old.copy(interruption = routeEvent) }
                     }
 
                     if (now - lastCheckpoint >= CHECKPOINT_MS) {
                         lastCheckpoint = now
-                        runCatching { sink.checkpoint() }
-                        runCatching { db.checkpointMeeting(id, transcript.toString(), output.absolutePath) }
+                        writer.checkpoint()
+                        db.checkpointMeeting(id, combinedTranscript(), writer.recoveryPath)
                     }
 
-                    val audioSafe = output.exists() && output.length() > 512L && now - lastGoodRead < 3_000L
+                    if (now - lastStorageCheck >= STORAGE_CHECK_MS) {
+                        lastStorageCheck = now
+                        val storage = RecordingPreflight.storageState(this)
+                        storageWarning = storage.warning
+                        if (storage.critical) {
+                            throw IOException("Storage critically low. Recording stopped safely before the audio file could be damaged.")
+                        }
+                    }
+
+                    val silenced = health?.isSilenced() == true
+                    val level = if (silenced) 0f else normalize(rms(buffer, read))
+                    val audioSafe = writer.hasDurableAudio && now - lastGoodRead < 3_000L && !silenced
+
                     if (now - lastUi >= UI_UPDATE_MS) {
                         lastUi = now
                         RecordingBus.update { old ->
@@ -214,10 +232,10 @@ class RecordingService : Service() {
                                 elapsedMs = now - startedAt,
                                 level = level,
                                 levels = (old.levels + level).takeLast(48),
-                                transcript = transcript.toString(),
-                                partial = partial,
                                 audioSafe = audioSafe,
+                                storageWarning = storageWarning,
                                 status = when {
+                                    silenced -> "interrupted"
                                     !audioSafe -> "securing"
                                     level < .035f -> "listening"
                                     else -> "voice"
@@ -228,41 +246,82 @@ class RecordingService : Service() {
                     }
                     if (now - lastNotification >= NOTIFICATION_UPDATE_MS) {
                         lastNotification = now
-                        updateNotification(now - startedAt, audioSafe)
+                        updateNotification(now - startedAt, audioSafe, silenced)
                     }
                 } else {
-                    // AudioRecord.stop() intentionally wakes a blocked read. A negative
-                    // return during a user-requested stop is normal shutdown, not damage.
                     if (!running.get()) break
                     consecutiveReadErrors++
                     if (read == AudioRecord.ERROR_DEAD_OBJECT) {
-                        throw IOException("Microphone disconnected")
+                        RecordingBus.update { old ->
+                            old.copy(
+                                audioSafe = false,
+                                status = "reconnecting",
+                                interruption = "Microphone route disconnected. MAI is reconnecting…"
+                            )
+                        }
+                        health?.close()
+                        health = null
+                        runCatching { currentAudio.stop() }
+                        runCatching { currentAudio.release() }
+                        activeAudio = null
+
+                        var replacement: Pair<AudioRecord, Int>? = null
+                        repeat(MAX_RECONNECT_ATTEMPTS) { attempt ->
+                            if (replacement == null && running.get()) {
+                                if (attempt > 0) Thread.sleep(300L)
+                                replacement = runCatching { openMicrophone() }.getOrNull()
+                            }
+                        }
+                        val reopened = replacement ?: throw IOException("Microphone disconnected and could not be restored")
+                        audio = reopened.first
+                        buffer = ByteArray(reopened.second)
+                        activeAudio = audio
+                        health = installHealthMonitor(audio!!)
+                        consecutiveReadErrors = 0
+                        RecordingBus.update { old ->
+                            old.copy(status = "recording", interruption = "Microphone reconnected. Recording continued.")
+                        }
+                        continue
                     }
                     if (consecutiveReadErrors >= 8) {
                         throw IOException("Microphone stopped delivering audio ($read)")
                     }
-                    Thread.sleep(20)
-                }
-            }
-
-            recognizer?.let { r ->
-                val text = runCatching { JSONObject(r.finalResult).optString("text").trim() }.getOrDefault("")
-                if (text.isNotBlank()) {
-                    if (transcript.isNotEmpty()) transcript.append('\n')
-                    transcript.append(text)
+                    Thread.sleep(20L)
                 }
             }
         } catch (t: Throwable) {
             recordingFailure = t
-            RecordingBus.update { it.copy(error = t.message ?: "Recording error", status = "error", active = false) }
+            RecordingBus.update {
+                it.copy(active = false, audioSafe = false, status = "error", error = t.message ?: "Recording error")
+            }
         } finally {
             activeAudio = null
+            health?.close()
             runCatching { audio?.stop() }
             runCatching { audio?.release() }
-            runCatching { recognizer?.close() }
-            runCatching { sink?.close() }
-            runCatching { db?.checkpointMeeting(id, transcript.toString(), output.takeIf { it.exists() }?.absolutePath) }
-            finalizeMeeting(id, output, transcript.toString(), recordingFailure)
+            runCatching { writer?.checkpoint() }
+            runCatching { db.checkpointMeeting(id, combinedTranscript(), writer?.recoveryPath) }
+            runCatching { transcriber?.close() }
+            val transcript = combinedTranscript()
+            val finalAudio = runCatching { writer?.finalizeFile(this) }
+                .getOrNull()
+                ?: runCatching { RecoverableAudioWriter.recover(this, id) }.getOrNull()
+            finalizeMeeting(id, finalAudio, transcript, recordingFailure)
+        }
+    }
+
+    private fun openMicrophone(): Pair<AudioRecord, Int> {
+        val created = createAudioRecord()
+        val audio = created.first
+        try {
+            audio.startRecording()
+            if (audio.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                throw IllegalStateException("Microphone did not enter recording state")
+            }
+            return created
+        } catch (t: Throwable) {
+            runCatching { audio.release() }
+            throw t
         }
     }
 
@@ -302,7 +361,7 @@ class RecordingService : Service() {
         throw IllegalStateException("No usable microphone input", lastError)
     }
 
-    private fun finalizeMeeting(id: String, output: File, transcript: String, failure: Throwable?) {
+    private fun finalizeMeeting(id: String, output: File?, transcript: String, failure: Throwable?) {
         val db = runCatching { MaiDb(this) }.getOrNull()
         val meeting = runCatching { db?.getMeeting(id) }.getOrNull()
         if (db != null && meeting != null) {
@@ -310,7 +369,7 @@ class RecordingService : Service() {
                 .getOrElse { MomEngine.generate("", meeting.participants, meeting.startedAt) }
             val retentionDays = getSharedPreferences("mai_settings", MODE_PRIVATE).getInt("audio_retention_days", 7)
             val ended = System.currentTimeMillis()
-            val path = output.takeIf { it.exists() && it.length() > 0 }?.absolutePath
+            val path = output?.takeIf { it.exists() && it.length() > 0L }?.absolutePath
             val expiry = if (retentionDays <= 0) null else ended + retentionDays * 86_400_000L
             runCatching {
                 db.finishMeeting(
@@ -336,7 +395,7 @@ class RecordingService : Service() {
                 partial = "",
                 status = "ready",
                 elapsedMs = endedAt - startedAt,
-                audioSafe = output.exists() && output.length() > 0,
+                audioSafe = output?.exists() == true && output.length() > 0L,
                 error = failure?.message
             )
         }
@@ -428,8 +487,12 @@ class RecordingService : Service() {
             .build()
     }
 
-    private fun updateNotification(elapsed: Long, audioSafe: Boolean) {
-        val status = if (audioSafe) "Audio stream active" else "Checking microphone"
+    private fun updateNotification(elapsed: Long, audioSafe: Boolean, silenced: Boolean) {
+        val status = when {
+            silenced -> "Microphone interrupted"
+            audioSafe -> "Audio checkpointed"
+            else -> "Securing audio"
+        }
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
             .notify(NOTIFICATION_ID, notification(status, elapsed))
     }
