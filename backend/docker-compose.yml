@@ -1,0 +1,44 @@
+services:
+  mai-backend:
+    build: .
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      MAI_ADMIN_CODE: ${MAI_ADMIN_CODE}
+      MAI_AUTH_DB: /data/mai-auth.sqlite3
+      MAI_SESSION_TTL_SECONDS: ${MAI_SESSION_TTL_SECONDS:-900}
+      MAI_ACTIVATION_TTL_SECONDS: ${MAI_ACTIVATION_TTL_SECONDS:-86400}
+      MAI_STT_MODEL: ${MAI_STT_MODEL:-gpt-transcribe}
+      MAI_DIARIZE_MODEL: ${MAI_DIARIZE_MODEL:-gpt-4o-transcribe-diarize}
+      MAI_LIVE_STT_MODEL: ${MAI_LIVE_STT_MODEL:-gpt-live-transcribe}
+      MAI_TRANSLATE_MODEL: ${MAI_TRANSLATE_MODEL:-gpt-5.6-terra}
+      MAI_MOM_MODEL: ${MAI_MOM_MODEL:-gpt-5.6-sol}
+      MAI_SEGMENT_SECONDS: ${MAI_SEGMENT_SECONDS:-480}
+      MAI_STT_WORKERS: ${MAI_STT_WORKERS:-4}
+      MAI_DIARIZE_WORKERS: ${MAI_DIARIZE_WORKERS:-3}
+      MAI_TRANSLATE_WORKERS: ${MAI_TRANSLATE_WORKERS:-4}
+    volumes:
+      - mai-auth:/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2.9-alpine
+    restart: unless-stopped
+    depends_on:
+      - mai-backend
+    environment:
+      MAI_DOMAIN: ${MAI_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  mai-auth:
+  caddy-data:
+  caddy-config:
