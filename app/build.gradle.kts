@@ -9,7 +9,6 @@ fun configuredValue(name: String): String =
         ?: System.getenv(name)?.trim().orEmpty()
 
 val maiBackendUrl = configuredValue("MAI_BACKEND_URL")
-val maiGatewayToken = configuredValue("MAI_GATEWAY_TOKEN")
 
 android {
     namespace = "com.mai.app"
@@ -19,12 +18,11 @@ android {
         applicationId = "com.mai.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 11
-        versionName = "1.3.0"
+        versionCode = 12
+        versionName = "1.3.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
         buildConfigField("String", "MAI_BACKEND_URL", quotedBuildValue(maiBackendUrl))
-        buildConfigField("String", "MAI_GATEWAY_TOKEN", quotedBuildValue(maiGatewayToken))
     }
 
     buildTypes {
