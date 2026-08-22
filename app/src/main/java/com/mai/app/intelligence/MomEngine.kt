@@ -28,6 +28,15 @@ object MomEngine {
     private val fillerStarts = listOf("okay", "ok ", "yeah", "yes ", "right ", "so ", "actually ", "basically ")
 
     fun generate(transcript: String, participants: List<Participant>, meetingStart: Long): MomResult {
+        // Fail closed: without verified text, MAI must not manufacture a local MOM.
+        if (transcript.isBlank()) {
+            return MomResult(
+                summary = "Audio saved safely. Accurate transcript and MOM are pending multilingual processing.",
+                decisions = emptyList(),
+                actions = emptyList()
+            )
+        }
+
         val lines = transcript
             .split(Regex("[\\n.!?]+"))
             .map(::normalizeSentence)
@@ -58,7 +67,6 @@ object MomEngine {
         val summary = when {
             summaryCandidates.isNotEmpty() -> summaryCandidates.joinToString(". ").trim().let { if (it.endsWith('.')) it else "$it." }
             decisions.isNotEmpty() -> decisions.take(2).joinToString(". ").let { if (it.endsWith('.')) it else "$it." }
-            transcript.isBlank() -> "Meeting recorded. No live transcript was available; review the saved audio if needed."
             else -> "Meeting recorded."
         }
         return MomResult(summary, decisions, actions)
@@ -97,8 +105,6 @@ object MomEngine {
     private fun dedupeActions(items: List<ActionRecord>): List<ActionRecord> {
         val out = mutableListOf<ActionRecord>()
         for (item in items) {
-            // Deliberately ignore owner while matching: the same task mentioned with different
-            // names is one canonical action. Owners/dates are merged instead of duplicating it.
             val existing = out.indexOfFirst { similarity(stripNames(it.text), stripNames(item.text)) >= 0.64 }
             if (existing < 0) out += item
             else {
