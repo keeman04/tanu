@@ -33,6 +33,13 @@ android {
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
+        create("qa") {
+            initWith(getByName("release"))
+            isDebuggable = true
+            signingConfig = signingConfigs.getByName("debug")
+            versionNameSuffix = "-qa"
+            matchingFallbacks += listOf("release", "debug")
+        }
     }
 
     compileOptions {
