@@ -13,8 +13,8 @@ android {
         applicationId = "com.mai.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.0.0"
+        versionCode = 6
+        versionName = "1.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
         buildConfigField("String", "MAI_BACKEND_URL", quotedBuildValue(providers.gradleProperty("MAI_BACKEND_URL").orElse("").get()))
@@ -56,6 +56,8 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
+    // Keep Vosk only as the offline English live-preview engine.
+    // Final Tamil/Tanglish transcription is produced by the MAI backend using OpenAI GPT Transcribe.
     implementation("com.alphacephei:vosk-android:0.3.75")
     implementation("com.alphacephei:vosk-model-en:0.3.38")
 
