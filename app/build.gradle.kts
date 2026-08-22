@@ -4,6 +4,12 @@ plugins {
 }
 
 fun quotedBuildValue(value: String): String = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+fun configuredValue(name: String): String =
+    (findProperty(name) as String?)?.trim().takeUnless { it.isNullOrBlank() }
+        ?: System.getenv(name)?.trim().orEmpty()
+
+val maiBackendUrl = configuredValue("MAI_BACKEND_URL")
+val maiGatewayToken = configuredValue("MAI_GATEWAY_TOKEN")
 
 android {
     namespace = "com.mai.app"
@@ -13,17 +19,18 @@ android {
         applicationId = "com.mai.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 10
-        versionName = "1.2.0"
+        versionCode = 11
+        versionName = "1.3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
-        buildConfigField("String", "MAI_BACKEND_URL", quotedBuildValue("https://mai-integrated-ai-keeman04-6969s-projects.vercel.app"))
-        buildConfigField("String", "MAI_GATEWAY_TOKEN", quotedBuildValue(""))
+        buildConfigField("String", "MAI_BACKEND_URL", quotedBuildValue(maiBackendUrl))
+        buildConfigField("String", "MAI_GATEWAY_TOKEN", quotedBuildValue(maiGatewayToken))
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -37,7 +44,6 @@ android {
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     packaging {
         resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}")
-        jniLibs.useLegacyPackaging = true
     }
 }
 
@@ -56,9 +62,6 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
-
-    implementation("com.alphacephei:vosk-android:0.3.75")
-    implementation("com.alphacephei:vosk-model-en:0.3.38")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
