@@ -300,9 +300,9 @@ class RecordingService : Service() {
             runCatching { writer?.checkpoint() }
             runCatching { db.checkpointMeeting(id, combinedTranscript(), writer?.recoveryPath) }
 
-            // Graceful user Stop reaches this path without interrupting the audio thread, so
-            // realtime STT gets a chance to flush its last buffered words. This live text is
-            // only a preview; the full AAC pass remains authoritative.
+            // Normal Stop reaches this path without interrupting the audio thread, so
+            // realtime STT gets a chance to flush its last buffered words. Live text is
+            // only a preview; the complete AAC pass remains authoritative.
             runCatching { transcriber?.close() }
             val transcript = combinedTranscript()
             val finalAudio = runCatching { writer?.finalizeFile(this) }
@@ -405,7 +405,10 @@ class RecordingService : Service() {
             it.copy(
                 active = false,
                 partial = "",
-                status = nextStatus,
+                // RecordingBus "ready" means local recording finalization completed and is
+                // used only to navigate out of the recording screen. Persistent meeting.status
+                // remains recorded/processing until final AI intelligence succeeds.
+                status = if (finalPath != null) "ready" else "error",
                 elapsedMs = endedAt - startedAt,
                 audioSafe = finalPath != null,
                 error = if (finalPath == null) failure?.message ?: "No usable audio was recovered" else null,
