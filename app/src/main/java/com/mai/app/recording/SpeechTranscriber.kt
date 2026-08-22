@@ -9,7 +9,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
 import java.io.Closeable
 import java.util.concurrent.CountDownLatch
@@ -159,7 +159,7 @@ class SpeechTranscriber(
 
     fun offer(data: ByteArray, length: Int) {
         if (!ready.get() || closed.get() || length <= 0) return
-        socket?.send(ByteString.of(data, 0, length))
+        socket?.send(data.toByteString(0, length))
     }
 
     fun transcript(): String = synchronized(lock) { finalText.toString().trim() }
