@@ -16,12 +16,14 @@ from pydantic import BaseModel, Field
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MAI_GATEWAY_TOKEN = os.getenv("MAI_GATEWAY_TOKEN", "").strip()
 STT_MODEL = os.getenv("MAI_STT_MODEL", "gpt-transcribe")
+DIARIZE_MODEL = os.getenv("MAI_DIARIZE_MODEL", "gpt-4o-transcribe-diarize")
 LIVE_STT_MODEL = os.getenv("MAI_LIVE_STT_MODEL", "gpt-live-transcribe")
 TRANSLATE_MODEL = os.getenv("MAI_TRANSLATE_MODEL", "gpt-5.6-terra")
 MOM_MODEL = os.getenv("MAI_MOM_MODEL", "gpt-5.6-sol")
 OPENAI_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 SEGMENT_SECONDS = int(os.getenv("MAI_SEGMENT_SECONDS", "480"))
 MAX_STT_WORKERS = max(1, min(int(os.getenv("MAI_STT_WORKERS", "4")), 6))
+MAX_DIARIZE_WORKERS = max(1, min(int(os.getenv("MAI_DIARIZE_WORKERS", "3")), 4))
 MAX_TRANSLATE_WORKERS = max(1, min(int(os.getenv("MAI_TRANSLATE_WORKERS", "4")), 6))
 
 DOMAIN_KEYWORDS = [
@@ -52,6 +54,7 @@ class MeetingResult(BaseModel):
     decisions: list[str] = Field(default_factory=list)
     actions: list[Action] = Field(default_factory=list)
     language: str | None = None
+    speakers: list[str] = Field(default_factory=list)
 
 
 class RealtimeSecretRequest(BaseModel):
@@ -83,11 +86,14 @@ def parse_participants(participants_json: str) -> list[str]:
     except json.JSONDecodeError:
         return []
     names: list[str] = []
+    seen: set[str] = set()
     for person in participants:
         if not isinstance(person, dict):
             continue
         name = str(person.get("name", "")).strip()
-        if name and name.casefold() not in {n.casefold() for n in names}:
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
             names.append(name)
     return names
 
@@ -129,11 +135,9 @@ def run_ffmpeg(input_path: Path, output_dir: Path) -> list[Path]:
 
 
 def transcribe_segment(path: Path, index: int, participant_names: list[str]) -> tuple[int, str]:
-    # Avoid an English-only free-text prompt here. Tamil/English code switching is guided
-    # using the model's native multiple-language and keyword hint fields instead.
-    multipart: list[tuple[str, tuple[Any, ...]]] = [
-        ("model", (None, STT_MODEL)),
-    ]
+    # The accurate content pass uses native multi-language + keyword hints instead of an
+    # English-only prompt, which avoids biasing Tamil/Tanglish speech toward English words.
+    multipart: list[tuple[str, tuple[Any, ...]]] = [("model", (None, STT_MODEL))]
     for language in language_hints():
         multipart.append(("languages[]", (None, language)))
     for keyword in transcription_keywords(participant_names):
@@ -164,6 +168,71 @@ def transcribe_segments(segments: list[Path], participant_names: list[str]) -> l
             index, text = future.result()
             results[index] = text
     return [results.get(i, "") for i in range(len(segments))]
+
+
+def safe_speaker_label(raw: Any, part_index: int) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_-]", "", str(raw or "").strip())[:24]
+    if not clean:
+        clean = "?"
+    # Labels from independently chunked files cannot safely be assumed to identify the same
+    # person across chunk boundaries, so part number is intentionally included.
+    return f"P{part_index + 1:02d}-{clean}"
+
+
+def diarize_segment(path: Path, index: int) -> tuple[int, str, list[str]]:
+    multipart: list[tuple[str, tuple[Any, ...]]] = [
+        ("model", (None, DIARIZE_MODEL)),
+        ("response_format", (None, "diarized_json")),
+        ("chunking_strategy", (None, "auto")),
+    ]
+    with path.open("rb") as handle:
+        multipart.append(("file", (path.name, handle, "audio/mpeg")))
+        with httpx.Client(timeout=httpx.Timeout(15 * 60, connect=30.0)) as client:
+            response = client.post(
+                f"{OPENAI_BASE}/audio/transcriptions",
+                headers=openai_headers(),
+                files=multipart,
+            )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Diarization failed ({response.status_code}): {response.text[:500]}")
+
+    payload = response.json()
+    lines: list[str] = []
+    labels: list[str] = []
+    for segment in payload.get("segments", []) or []:
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        label = safe_speaker_label(segment.get("speaker"), index)
+        if label not in labels:
+            labels.append(label)
+        lines.append(f"[{label}] {text}")
+    return index, "\n".join(lines), labels
+
+
+def diarize_segments(segments: list[Path]) -> tuple[list[str], list[str]]:
+    # Diarization enriches the transcript but must never block the authoritative content
+    # pass. If a diarization request fails, that part falls back to an unlabeled transcript.
+    results: dict[int, str] = {}
+    labels: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(MAX_DIARIZE_WORKERS, len(segments))) as executor:
+        futures = {
+            executor.submit(diarize_segment, path, index): index
+            for index, path in enumerate(segments)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                _, text, segment_labels = future.result()
+                results[index] = text
+                for label in segment_labels:
+                    if label not in labels:
+                        labels.append(label)
+            except Exception:
+                results[index] = ""
+    return [results.get(i, "") for i in range(len(segments))], labels
 
 
 def extract_response_text(payload: dict[str, Any]) -> str:
@@ -200,33 +269,60 @@ def response_text(model: str, prompt: str, max_output_tokens: int) -> str:
     return text
 
 
-def translate_segment(text: str, index: int, participant_names: list[str]) -> tuple[int, str]:
-    if not text.strip():
+def translate_segment(
+    authoritative_text: str,
+    index: int,
+    participant_names: list[str],
+    diarized_text: str = "",
+) -> tuple[int, str]:
+    if not authoritative_text.strip():
         return index, ""
     participant_context = ", ".join(participant_names) if participant_names else "not supplied"
-    prompt = f"""Translate this meeting transcript into faithful, natural English.
+    guide = diarized_text.strip() or "No reliable speaker guide was available for this part."
+    prompt = f"""Create a faithful English meeting transcript for PART {index + 1:02d}.
+
+You receive TWO inputs:
+1. AUTHORITATIVE CONTENT TRANSCRIPT: source of truth for every word, fact, name, number and commitment.
+2. DIARIZATION GUIDE: used ONLY to identify speaker-turn boundaries and generic speaker labels.
 
 Accuracy rules:
-- This is translation, NOT summarization. Keep every meaningful statement.
+- This is translation/transcript alignment, NOT summarization. Keep every meaningful statement from the authoritative content.
 - Source may be Tamil, English, or Tamil-English code-switching (Tanglish).
 - Preserve proper names exactly. Known participant names: {participant_context}.
 - Preserve numbers, money, dates, times, percentages, product names and commitments exactly.
-- Keep already-English phrases in English.
-- Do not add facts, speakers, owners, dates or explanations that are not present.
+- If the diarization guide contains labels like [P01-A], preserve those labels exactly on the corresponding English turns.
+- Generic labels such as P01-A are NOT participant identities. Never replace a generic label with a participant name merely by guessing.
+- If the two inputs disagree about wording, the AUTHORITATIVE CONTENT TRANSCRIPT wins.
+- If the diarization guide is missing or cannot be aligned safely, output the faithful English transcript without inventing speaker labels.
+- Do not add facts, owners, dates or explanations that are not present.
 - If a phrase is genuinely unclear, write [unclear] instead of guessing.
 - Output only the English transcript text.
 
-SOURCE TRANSCRIPT:
-{text}
+AUTHORITATIVE CONTENT TRANSCRIPT:
+{authoritative_text}
+
+DIARIZATION GUIDE:
+{guide}
 """
-    return index, response_text(TRANSLATE_MODEL, prompt, max_output_tokens=12000)
+    return index, response_text(TRANSLATE_MODEL, prompt, max_output_tokens=14000)
 
 
-def translate_segments(transcripts: list[str], participant_names: list[str]) -> list[str]:
+def translate_segments(
+    transcripts: list[str],
+    participant_names: list[str],
+    diarized_transcripts: list[str] | None = None,
+) -> list[str]:
+    diarized_transcripts = diarized_transcripts or [""] * len(transcripts)
     results: dict[int, str] = {}
     with ThreadPoolExecutor(max_workers=min(MAX_TRANSLATE_WORKERS, max(1, len(transcripts)))) as executor:
         futures = [
-            executor.submit(translate_segment, text, index, participant_names)
+            executor.submit(
+                translate_segment,
+                text,
+                index,
+                participant_names,
+                diarized_transcripts[index] if index < len(diarized_transcripts) else "",
+            )
             for index, text in enumerate(transcripts)
         ]
         for future in as_completed(futures):
@@ -267,8 +363,10 @@ def normalize_result(
     meeting_id: str,
     transcript_english: str,
     participant_names: list[str] | None = None,
+    speaker_labels: list[str] | None = None,
 ) -> MeetingResult:
     participant_names = participant_names or []
+    speaker_labels = speaker_labels or []
     decisions: list[str] = []
     seen_decisions: set[str] = set()
     for item in raw.get("decisions", []) or []:
@@ -312,6 +410,7 @@ def normalize_result(
         decisions=decisions[:12],
         actions=actions[:20],
         language=str(raw.get("language", "")).strip() or None,
+        speakers=speaker_labels,
     )
 
 
@@ -331,6 +430,7 @@ def build_mom(
     started_at: str,
     participant_names: list[str],
     transcript_english: str,
+    speaker_labels: list[str] | None = None,
 ) -> MeetingResult:
     names = ", ".join(participant_names) if participant_names else "Unknown"
     date = meeting_date(started_at)
@@ -346,6 +446,8 @@ Rules:
 - Actions: include only explicit commitments, requests or assigned work. Maximum 20.
 - Action text must state exactly what needs to be done, not a vague summary.
 - Owner may ONLY be one or more exact names from this participant list: {names}. If the owner is not clearly stated, use null.
+- Generic diarization labels such as P01-A are not participant names and can NEVER be used as action owners.
+- A speaker label alone does not prove that speaker's real-world identity. Never infer a participant name from a generic label.
 - For due dates: use YYYY-MM-DD only when a date or relative deadline is explicitly supported. Meeting date is {date}. If unclear, use null.
 - Never infer an owner merely because that person discussed the topic.
 - Never convert a suggestion into a decision or action.
@@ -365,7 +467,7 @@ VERIFIED ENGLISH TRANSCRIPT:
 """
     text = strip_json_fence(response_text(MOM_MODEL, prompt, max_output_tokens=8000))
     raw = json.loads(text)
-    return normalize_result(raw, meeting_id, transcript_english, participant_names)
+    return normalize_result(raw, meeting_id, transcript_english, participant_names, speaker_labels)
 
 
 @app.get("/health")
@@ -375,6 +477,7 @@ def health() -> dict[str, Any]:
         "openai_configured": bool(OPENAI_API_KEY),
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "stt_model": STT_MODEL,
+        "diarize_model": DIARIZE_MODEL,
         "live_stt_model": LIVE_STT_MODEL,
         "translate_model": TRANSLATE_MODEL,
         "mom_model": MOM_MODEL,
@@ -463,12 +566,19 @@ def process_meeting(
         segments_dir.mkdir()
         segments = run_ffmpeg(source, segments_dir)
         try:
-            original_segments = transcribe_segments(segments, participant_names)
+            # Accuracy pass and speaker-boundary pass are deliberately separate. The first
+            # owns the words; diarization can enrich speaker turns but cannot overwrite facts.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                content_future = executor.submit(transcribe_segments, segments, participant_names)
+                diarize_future = executor.submit(diarize_segments, segments)
+                original_segments = content_future.result()
+                diarized_segments, speaker_labels = diarize_future.result()
+
             original_transcript = "\n".join(x for x in original_segments if x).strip()
             if not original_transcript:
                 raise HTTPException(status_code=422, detail="No speech was transcribed")
 
-            english_segments = translate_segments(original_segments, participant_names)
+            english_segments = translate_segments(original_segments, participant_names, diarized_segments)
             english_transcript = "\n".join(x for x in english_segments if x).strip()
             if not english_transcript:
                 raise HTTPException(status_code=422, detail="No English transcript was produced")
@@ -479,6 +589,7 @@ def process_meeting(
                 started_at=started_at,
                 participant_names=participant_names,
                 transcript_english=english_transcript,
+                speaker_labels=speaker_labels,
             )
         except HTTPException:
             raise
