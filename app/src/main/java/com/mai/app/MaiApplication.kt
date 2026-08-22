@@ -6,6 +6,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import com.mai.app.data.MaiDb
 import com.mai.app.intelligence.MomEngine
+import com.mai.app.recording.RecoverableAudioWriter
 import com.mai.app.retention.AudioRetentionWorker
 import java.util.concurrent.TimeUnit
 
@@ -20,23 +21,26 @@ class MaiApplication : Application() {
             settings.edit().putInt("audio_retention_days", 7).apply()
         }
 
-        // Recover any session Android killed while MAI was recording. The last durable
-        // transcript/audio checkpoint is converted into a normal usable meeting record.
+        // If Android killed MAI mid-meeting, independently closed 15-second chunks are
+        // rebuilt into a normal AAC file before the interrupted session is finalized.
         runCatching {
             val db = MaiDb(this)
             db.recoverInterruptedMeetings()
             val retentionDays = settings.getInt("audio_retention_days", 7)
             db.listMeetings().filter { it.status == "interrupted" }.forEach { meeting ->
+                val recoveredAudio = runCatching { RecoverableAudioWriter.recover(this, meeting.id) }.getOrNull()
                 val mom = MomEngine.generate(meeting.transcript, meeting.participants, meeting.startedAt)
                 val ended = meeting.endedAt ?: System.currentTimeMillis()
                 db.finishMeeting(
                     id = meeting.id,
                     endedAt = ended,
                     transcript = meeting.transcript,
-                    summary = if (meeting.transcript.isBlank()) "Meeting was interrupted. Saved audio was preserved where possible." else mom.summary,
+                    summary = if (meeting.transcript.isBlank()) {
+                        "Meeting was interrupted. Saved audio was recovered where possible."
+                    } else mom.summary,
                     decisions = mom.decisions,
                     actions = mom.actions,
-                    audioPath = meeting.audioPath,
+                    audioPath = recoveredAudio?.absolutePath ?: meeting.audioPath?.takeIf { java.io.File(it).isFile },
                     audioExpiresAt = if (retentionDays <= 0) null else ended + retentionDays * 86_400_000L
                 )
             }
