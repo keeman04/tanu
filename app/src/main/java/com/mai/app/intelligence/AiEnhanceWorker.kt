@@ -5,6 +5,7 @@ import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.WorkerParameters
 import com.mai.app.BuildConfig
+import com.mai.app.auth.MaiDeviceAuth
 import com.mai.app.data.ActionRecord
 import com.mai.app.data.MaiDb
 import kotlinx.coroutines.Dispatchers
@@ -57,6 +58,29 @@ class AiEnhanceWorker(appContext: Context, params: WorkerParameters) : Coroutine
             return@withContext Result.success()
         }
 
+        val auth = MaiDeviceAuth(applicationContext)
+        if (!auth.isActivated()) {
+            auth.close()
+            db.updateStatus(
+                id,
+                "recorded",
+                "Audio saved safely. Activate this device in MAI before final AI processing."
+            )
+            return@withContext Result.success()
+        }
+
+        val sessionToken = try {
+            auth.sessionToken()
+        } catch (_: Throwable) {
+            auth.close()
+            db.updateStatus(
+                id,
+                "recorded",
+                "Audio saved safely. MAI device authentication needs attention before final processing."
+            )
+            return@withContext Result.success()
+        }
+
         db.updateStatus(
             id,
             "processing",
@@ -78,13 +102,12 @@ class AiEnhanceWorker(appContext: Context, params: WorkerParameters) : Coroutine
             .addFormDataPart("audio", audio.name, audio.asRequestBody("audio/aac".toMediaType()))
             .build()
 
-        val requestBuilder = Request.Builder()
+        val request = Request.Builder()
             .url("$backend/v1/meetings/process")
             .post(body)
             .header("Accept", "application/json")
-        BuildConfig.MAI_GATEWAY_TOKEN.trim().takeIf(String::isNotBlank)?.let {
-            requestBuilder.header("Authorization", "Bearer $it")
-        }
+            .header("Authorization", "Bearer $sessionToken")
+            .build()
 
         val client = OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
@@ -94,9 +117,16 @@ class AiEnhanceWorker(appContext: Context, params: WorkerParameters) : Coroutine
             .build()
 
         try {
-            client.newCall(requestBuilder.build()).execute().use { response ->
+            client.newCall(request).execute().use { response ->
                 val responseBody = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
+                    if (response.code == 401 || response.code == 403) {
+                        MaiDeviceAuth.invalidateSession()
+                        if (runAttemptCount < 4) {
+                            db.updateStatus(id, "processing", "MAI device session expired and will refresh automatically.")
+                            return@withContext Result.retry()
+                        }
+                    }
                     val retryable = response.code == 408 || response.code == 429 || response.code >= 500
                     if (retryable && runAttemptCount < 4) {
                         db.updateStatus(id, "processing", "MAI processing was interrupted and will retry automatically.")
@@ -176,6 +206,7 @@ class AiEnhanceWorker(appContext: Context, params: WorkerParameters) : Coroutine
                 Result.success()
             }
         } finally {
+            auth.close()
             client.dispatcher.executorService.shutdown()
             client.connectionPool.evictAll()
         }
