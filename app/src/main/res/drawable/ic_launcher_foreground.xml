@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Antenna from the selected MAI robot mark -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#0F0F0F"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:pathData="M54,27 L54,17" />
+    <path
+        android:fillColor="#0F0F0F"
+        android:pathData="M54,8 A6,6 0,1 1,53.99 8 Z" />
+
+    <!-- Headset ear pads -->
+    <path
+        android:fillColor="#0F0F0F"
+        android:pathData="M20,45 C15.6,45 13,48.4 13,52.5 L13,63 C13,67.2 15.6,70.5 20,70.5 L25,70.5 L25,45 Z" />
+    <path
+        android:fillColor="#0F0F0F"
+        android:pathData="M88,45 C92.4,45 95,48.4 95,52.5 L95,63 C95,67.2 92.4,70.5 88,70.5 L83,70.5 L83,45 Z" />
+
+    <!-- Circular speech-bubble shell -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:strokeColor="#0F0F0F"
+        android:strokeWidth="5"
+        android:strokeLineJoin="round"
+        android:pathData="M54,26 C74,26 87,38.6 87,57 C87,75.4 73.8,87 54,87 C49.2,87 44.8,86.3 40.9,84.9 L26.5,95 L29.2,79.2 C22.8,73.7 19,66.1 19,57 C19,38.6 32.4,26 54,26 Z" />
+
+    <!-- Friendly rounded robot face -->
+    <path
+        android:fillColor="#0F0F0F"
+        android:pathData="M38,41 L70,41 C75,41 78.5,44.8 78.5,49.4 L78.5,63 C78.5,69.1 74.1,73 67.8,73 L40.2,73 C33.9,73 29.5,69.1 29.5,63 L29.5,49.4 C29.5,44.8 33,41 38,41 Z" />
+
+    <!-- Smiling eyes -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4.1"
+        android:strokeLineCap="round"
+        android:pathData="M38.5,56.5 C38.5,50.2 47.5,50.2 47.5,56.5" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4.1"
+        android:strokeLineCap="round"
+        android:pathData="M60.5,56.5 C60.5,50.2 69.5,50.2 69.5,56.5" />
+</vector>
