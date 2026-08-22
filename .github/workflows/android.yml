@@ -1,7 +1,7 @@
 name: MAI Android
 on:
   push:
-    branches: [ main, mai-production, fix-launch-icon-crash ]
+    branches: [ main, mai-production, fix-launch-icon-crash, mai-v1-hardening ]
   pull_request:
     branches: [ main ]
 
@@ -58,7 +58,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.1.0-RC2-Android
+          name: MAI-V1.0.0-Android
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
           if-no-files-found: error
