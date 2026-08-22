@@ -118,8 +118,6 @@ class RecordingService : Service() {
             try {
                 captureLoop(id)
             } catch (t: Throwable) {
-                // Last-resort guard: an exception on the audio thread must never be allowed
-                // to become an uncaught process-level crash.
                 RecordingBus.update { it.copy(error = t.message ?: "Recording error", status = "error") }
                 finalizeMeeting(id, File(File(filesDir, "audio"), "$id.aac"), "", t)
             }
@@ -172,8 +170,6 @@ class RecordingService : Service() {
                     lastGoodRead = now
                     sink.writePcm(buffer, read)
 
-                    // Start optional offline STT only after the microphone is confirmed live.
-                    // It is never allowed to gate or precede audio capture.
                     if (!speechLoadRequested) {
                         speechLoadRequested = true
                         runCatching { SpeechModelHolder.ensureForRecording(this) }
@@ -235,6 +231,9 @@ class RecordingService : Service() {
                         updateNotification(now - startedAt, audioSafe)
                     }
                 } else {
+                    // AudioRecord.stop() intentionally wakes a blocked read. A negative
+                    // return during a user-requested stop is normal shutdown, not damage.
+                    if (!running.get()) break
                     consecutiveReadErrors++
                     if (read == AudioRecord.ERROR_DEAD_OBJECT) {
                         throw IOException("Microphone disconnected")
@@ -268,6 +267,10 @@ class RecordingService : Service() {
     }
 
     private fun createAudioRecord(): Pair<AudioRecord, Int> {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            throw SecurityException("Microphone permission was revoked")
+        }
+
         val minBuffer = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
@@ -305,7 +308,7 @@ class RecordingService : Service() {
         if (db != null && meeting != null) {
             val mom = runCatching { MomEngine.generate(transcript, meeting.participants, meeting.startedAt) }
                 .getOrElse { MomEngine.generate("", meeting.participants, meeting.startedAt) }
-            val retentionDays = getSharedPreferences("mai_settings", MODE_PRIVATE).getInt("audio_retention_days", 0)
+            val retentionDays = getSharedPreferences("mai_settings", MODE_PRIVATE).getInt("audio_retention_days", 7)
             val ended = System.currentTimeMillis()
             val path = output.takeIf { it.exists() && it.length() > 0 }?.absolutePath
             val expiry = if (retentionDays <= 0) null else ended + retentionDays * 86_400_000L
