@@ -13,8 +13,8 @@ android {
         applicationId = "com.mai.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.1.0-rc1"
+        versionCode = 4
+        versionName = "1.1.0-rc2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
         buildConfigField("String", "MAI_BACKEND_URL", quotedBuildValue(providers.gradleProperty("MAI_BACKEND_URL").orElse("").get()))
@@ -56,7 +56,10 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    implementation("com.alphacephei:vosk-android:0.3.38")
+    // 0.3.38 shipped 4 KiB-aligned native libraries and can crash on newer
+    // 16 KiB page-size devices when Vosk is first loaded. 0.3.75 contains the
+    // newer Android native build. CI additionally inspects the resulting APK.
+    implementation("com.alphacephei:vosk-android:0.3.75")
     implementation("com.alphacephei:vosk-model-en:0.3.38")
 
     testImplementation("junit:junit:4.13.2")
