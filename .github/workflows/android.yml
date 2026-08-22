@@ -38,14 +38,14 @@ jobs:
           else
             echo "::warning::MAI_BACKEND_URL is not configured. Recording works, but final Tamil/Tanglish AI enhancement remains in recorded/pending state."
           fi
-      - name: Build APK
+      - name: Build hardened QA APK
         env:
           MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
           MAI_GATEWAY_TOKEN: ${{ secrets.MAI_GATEWAY_TOKEN }}
-        run: gradle --no-daemon assembleDebug -PMAI_BACKEND_URL="$MAI_BACKEND_URL" -PMAI_GATEWAY_TOKEN="$MAI_GATEWAY_TOKEN"
+        run: gradle --no-daemon assembleQa -PMAI_BACKEND_URL="$MAI_BACKEND_URL" -PMAI_GATEWAY_TOKEN="$MAI_GATEWAY_TOKEN"
       - name: Reject oversized APK regressions
         run: |
-          APK=app/build/outputs/apk/debug/app-debug.apk
+          APK=app/build/outputs/apk/qa/app-qa.apk
           SIZE=$(stat -c%s "$APK")
           MAX=$((50 * 1024 * 1024))
           echo "APK size: $SIZE bytes"
@@ -55,16 +55,18 @@ jobs:
           fi
       - name: Ensure Vosk model is not packaged
         run: |
-          if unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -Eiq 'vosk|model-en-us'; then
+          APK=app/build/outputs/apk/qa/app-qa.apk
+          if unzip -l "$APK" | grep -Eiq 'vosk|model-en-us'; then
             echo "::error::Unused Vosk/English speech model is still packaged."
             exit 1
           fi
           echo "No Vosk speech model found in APK."
       - name: Validate 16 KiB arm64 native alignment
         run: |
+          APK=app/build/outputs/apk/qa/app-qa.apk
           rm -rf /tmp/mai-apk-check
           mkdir -p /tmp/mai-apk-check
-          unzip -q app/build/outputs/apk/debug/app-debug.apk 'lib/arm64-v8a/*.so' -d /tmp/mai-apk-check || true
+          unzip -q "$APK" 'lib/arm64-v8a/*.so' -d /tmp/mai-apk-check || true
           python3 - <<'PY'
           import glob, subprocess, sys
           bad = []
@@ -87,8 +89,8 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.3.0-Hardened-Android
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: MAI-V1.3.0-Hardened-QA
+          path: app/build/outputs/apk/qa/app-qa.apk
           retention-days: 30
           if-no-files-found: error
 
