@@ -3,6 +3,7 @@ package com.mai.app.recording
 import android.content.Context
 import android.util.Base64
 import com.mai.app.BuildConfig
+import com.mai.app.data.MaiDb
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -27,9 +28,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * 24 kHz PCM, so only the mirrored live stream is resampled to 24 kHz here.
  */
 class SpeechTranscriber(
-    @Suppress("UNUSED_PARAMETER") context: Context,
+    context: Context,
     private val sampleRate: Int = 16_000,
-    private val participantNames: List<String> = emptyList(),
+    participantNames: List<String> = emptyList(),
     private val onUpdate: (transcript: String, partial: String) -> Unit,
     private val onWarning: (String) -> Unit
 ) : Closeable {
@@ -39,6 +40,15 @@ class SpeechTranscriber(
         private val RECONNECT_DELAYS_MS = longArrayOf(1_000, 2_000, 4_000, 8_000, 15_000)
     }
 
+    private val names: List<String> = participantNames.ifEmpty {
+        runCatching {
+            MaiDb(context.applicationContext).listMeetings()
+                .firstOrNull { it.status == "recording" }
+                ?.participants
+                ?.map { it.name }
+                .orEmpty()
+        }.getOrDefault(emptyList())
+    }
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -62,18 +72,20 @@ class SpeechTranscriber(
     private fun requestConnection(immediate: Boolean = false) {
         if (closed.get() || !reconnecting.compareAndSet(false, true)) return
         Thread {
+            var retryAfter = false
             try {
                 if (!immediate) {
                     val attempt = reconnectAttempt.getAndIncrement()
                     val delay = RECONNECT_DELAYS_MS[minOf(attempt, RECONNECT_DELAYS_MS.lastIndex)]
                     Thread.sleep(delay)
                 }
-                if (!closed.get()) connectOnce()
+                if (!closed.get()) retryAfter = !connectOnce()
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             } finally {
                 reconnecting.set(false)
             }
+            if (retryAfter && !closed.get()) requestConnection()
         }.apply {
             isDaemon = true
             name = "mai-live-stt-connect"
@@ -81,15 +93,15 @@ class SpeechTranscriber(
         }
     }
 
-    private fun connectOnce() {
+    private fun connectOnce(): Boolean {
         val base = BuildConfig.MAI_BACKEND_URL.trim().trimEnd('/')
         if (base.isBlank()) {
             onWarning("Live transcription is unavailable until the MAI backend is configured.")
-            return
+            return true
         }
-        try {
+        return try {
             val payload = JSONObject()
-                .put("participants", JSONArray().apply { participantNames.forEach { put(it) } })
+                .put("participants", JSONArray().apply { names.forEach { put(it) } })
                 .toString()
             val request = Request.Builder()
                 .url("$base/v1/realtime/client-secret")
@@ -110,11 +122,10 @@ class SpeechTranscriber(
                 if (token.isBlank() || url.isBlank()) throw IllegalStateException("token response was incomplete")
                 if (!closed.get()) openSocket(url, token)
             }
+            true
         } catch (t: Throwable) {
-            if (!closed.get()) {
-                onWarning("Live transcript reconnecting: ${t.message ?: "network unavailable"}")
-                requestConnection()
-            }
+            if (!closed.get()) onWarning("Live transcript reconnecting: ${t.message ?: "network unavailable"}")
+            false
         }
     }
 
@@ -149,7 +160,7 @@ class SpeechTranscriber(
                                                 .put("model", "gpt-live-transcribe")
                                                 .put("languages", JSONArray().put("ta").put("en"))
                                                 .put("keywords", JSONArray().apply {
-                                                    participantNames.take(20).forEach { name ->
+                                                    names.take(20).forEach { name ->
                                                         val clean = name.replace("\n", " ").replace("\r", " ")
                                                             .replace("<", "").replace(">", "").trim()
                                                         if (clean.isNotBlank()) put(clean)
@@ -171,12 +182,12 @@ class SpeechTranscriber(
                     )
                 if (!webSocket.send(session.toString())) {
                     ready.set(false)
-                    bufferWarningAndReconnect("Live transcription session could not start.")
+                    onWarning("Live transcription session could not start. Reconnecting…")
+                    requestConnection()
                     return
                 }
                 ready.set(true)
                 flushBuffered(webSocket)
-                onWarning("Live multilingual transcript connected.")
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -284,18 +295,14 @@ class SpeechTranscriber(
             queuedBytes = 0
             list
         }
-        for (chunk in pending) {
-            if (!sendPcm(webSocket, chunk)) {
+        for (index in pending.indices) {
+            if (!sendPcm(webSocket, pending[index])) {
                 ready.set(false)
-                enqueuePcm(chunk)
+                for (remaining in index until pending.size) enqueuePcm(pending[remaining])
+                requestConnection()
                 break
             }
         }
-    }
-
-    private fun bufferWarningAndReconnect(message: String) {
-        onWarning(message)
-        requestConnection()
     }
 
     private fun resample16kTo24k(input: ByteArray, length: Int): ByteArray {
