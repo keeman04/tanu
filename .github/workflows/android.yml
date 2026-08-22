@@ -29,8 +29,20 @@ jobs:
         run: gradle --no-daemon testDebugUnitTest
       - name: Android lint
         run: gradle --no-daemon lintDebug
+      - name: Check MAI backend configuration
+        env:
+          MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
+        run: |
+          if [ -n "$MAI_BACKEND_URL" ]; then
+            echo "MAI backend URL is configured for this APK."
+          else
+            echo "::warning::MAI_BACKEND_URL is not configured. Recording works, but final Tamil/Tanglish AI enhancement will remain disabled in this APK."
+          fi
       - name: Build APK
-        run: gradle --no-daemon assembleDebug
+        env:
+          MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
+          MAI_GATEWAY_TOKEN: ${{ secrets.MAI_GATEWAY_TOKEN }}
+        run: gradle --no-daemon assembleDebug -PMAI_BACKEND_URL="$MAI_BACKEND_URL" -PMAI_GATEWAY_TOKEN="$MAI_GATEWAY_TOKEN"
       - name: Validate 16 KiB arm64 native alignment
         run: |
           rm -rf /tmp/mai-apk-check
@@ -58,7 +70,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.0.0-Android
+          name: MAI-V1.1.0-Tamil-Accurate-Android
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
           if-no-files-found: error
