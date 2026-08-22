@@ -29,20 +29,26 @@ jobs:
         run: gradle --no-daemon testDebugUnitTest
       - name: Android lint
         run: gradle --no-daemon lintDebug
+      - name: Reject shared backend secrets in Android
+        run: |
+          if grep -R "MAI_GATEWAY_TOKEN" app/src app/build.gradle.kts; then
+            echo "::error::Shared MAI gateway token must never be compiled into the APK."
+            exit 1
+          fi
+          echo "Android uses per-device Keystore authentication; no shared gateway token source found."
       - name: Check MAI backend configuration
         env:
           MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
         run: |
           if [ -n "$MAI_BACKEND_URL" ]; then
-            echo "MAI backend URL is configured for this APK."
+            echo "MAI backend URL is configured for this APK. Device activation will be required."
           else
             echo "::warning::MAI_BACKEND_URL is not configured. Recording works, but final Tamil/Tanglish AI enhancement remains in recorded/pending state."
           fi
       - name: Build hardened QA APK
         env:
           MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
-          MAI_GATEWAY_TOKEN: ${{ secrets.MAI_GATEWAY_TOKEN }}
-        run: gradle --no-daemon assembleQa -PMAI_BACKEND_URL="$MAI_BACKEND_URL" -PMAI_GATEWAY_TOKEN="$MAI_GATEWAY_TOKEN"
+        run: gradle --no-daemon assembleQa -PMAI_BACKEND_URL="$MAI_BACKEND_URL"
       - name: Reject oversized APK regressions
         run: |
           APK=app/build/outputs/apk/qa/app-qa.apk
@@ -89,7 +95,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.3.0-Hardened-QA
+          name: MAI-V1.3.1-Device-Auth-QA
           path: app/build/outputs/apk/qa/app-qa.apk
           retention-days: 30
           if-no-files-found: error
@@ -115,8 +121,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Backend unit tests
         run: PYTHONPATH=. pytest -q
-      - name: Validate backend module
-        run: python -m py_compile app.py
+      - name: Validate backend modules
+        run: python -m py_compile app.py device_auth.py secure_app.py
 
   cold-start-smoke:
     strategy:
