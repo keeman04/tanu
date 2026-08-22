@@ -68,10 +68,11 @@ class MaiApplication : Application() {
 
                 // WorkManager is persistent, but app upgrades/device cleanup can remove a queued
                 // request. Re-enqueue any safely recorded meeting that still needs final processing.
+                // A failed processing job with intact audio is also safe to retry on next launch.
                 if (backendConfigured) {
                     db.listMeetings()
-                        .filter { it.status in setOf("processing", "recorded") }
-                        .filter { it.audioPath?.let(::File)?.isFile == true }
+                        .filter { it.status in setOf("processing", "recorded", "processing_failed") }
+                        .filter { it.audioPath?.let(::File)?.let { file -> file.isFile && file.length() > 512L } == true }
                         .forEach { enqueueAi(it.id) }
                 }
             }
