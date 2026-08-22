@@ -1,8 +1,6 @@
 package com.mai.app.recording
 
 import android.content.Context
-import android.system.Os
-import android.system.OsConstants
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.vosk.Model
@@ -13,8 +11,7 @@ object SpeechModelHolder {
     @Volatile var model: Model? = null
         private set
 
-    // The app UI and the recording service must never depend on speech recognition.
-    // Audio capture is the source of truth; STT is an optional enhancement.
+    // Audio capture is always the source of truth; STT is optional and never gates it.
     private val _ready = MutableStateFlow(true)
     val ready: StateFlow<Boolean> = _ready
 
@@ -31,18 +28,7 @@ object SpeechModelHolder {
         _ready.value = true
     }
 
-    /**
-     * Loads Vosk only on devices where the native page-size path is known-safe for this
-     * candidate. 16 KiB devices still record normally and can use the MAI backend after
-     * the meeting; we deliberately prefer a missing live transcript over losing audio.
-     */
     fun ensureForRecording(context: Context) {
-        val pageSize = runCatching { Os.sysconf(OsConstants._SC_PAGESIZE) }.getOrDefault(4096L)
-        if (pageSize > 4096L) {
-            _error.value = "Live offline transcript is disabled on this device; audio recording remains active."
-            _ready.value = true
-            return
-        }
         loadModel(context.applicationContext)
     }
 
