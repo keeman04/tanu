@@ -32,7 +32,8 @@ def _signed_session(private_key, device_id: str, timestamp: int, nonce: str) -> 
 
 def test_device_enrollment_session_and_replay_protection(tmp_path, monkeypatch):
     monkeypatch.setenv("MAI_AUTH_DB", str(tmp_path / "auth.sqlite3"))
-    monkeypatch.setenv("MAI_ENROLLMENT_CODES", "MAI-TEST-CODE-001,MAI-TEST-CODE-002")
+    monkeypatch.delenv("MAI_ENROLLMENT_CODES", raising=False)
+    monkeypatch.delenv("MAI_ENROLLMENT_CODE", raising=False)
     monkeypatch.setenv("MAI_ADMIN_CODE", "MAI-ADMIN-TEST")
     client = TestClient(secure_app.app)
 
@@ -40,6 +41,15 @@ def test_device_enrollment_session_and_replay_protection(tmp_path, monkeypatch):
     assert status.status_code == 200
     assert status.json()["device_auth"] is True
     assert status.json()["enrollment_configured"] is True
+    assert status.json()["admin_code_generation"] is True
+
+    activation = client.post(
+        "/v1/auth/activation-code",
+        headers={"X-MAI-Admin": "MAI-ADMIN-TEST"},
+    )
+    assert activation.status_code == 200
+    activation_code = activation.json()["activation_code"]
+    assert activation_code.startswith("MAI-")
 
     private_key, public_key = _new_device()
     device_id = str(uuid.uuid4())
@@ -48,7 +58,7 @@ def test_device_enrollment_session_and_replay_protection(tmp_path, monkeypatch):
         json={
             "device_id": device_id,
             "public_key": public_key,
-            "activation_code": "MAI-TEST-CODE-001",
+            "activation_code": activation_code,
             "label": "Pixel test",
         },
     )
@@ -64,6 +74,15 @@ def test_device_enrollment_session_and_replay_protection(tmp_path, monkeypatch):
     assert token
     assert session.json()["expires_at"] > now
     assert device_auth.require_auth(f"Bearer {token}") == device_id
+
+    unauthenticated = client.post("/v1/realtime/client-secret", json={"participants": ["Test"]})
+    assert unauthenticated.status_code == 401
+    authenticated = client.post(
+        "/v1/realtime/client-secret",
+        json={"participants": ["Test"]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert authenticated.status_code != 401
 
     replay = client.post("/v1/auth/session", json=payload)
     assert replay.status_code == 401
@@ -85,6 +104,7 @@ def test_device_enrollment_session_and_replay_protection(tmp_path, monkeypatch):
 def test_activation_code_is_single_use_across_devices(tmp_path, monkeypatch):
     monkeypatch.setenv("MAI_AUTH_DB", str(tmp_path / "auth.sqlite3"))
     monkeypatch.setenv("MAI_ENROLLMENT_CODES", "ONE-TIME-MAI-CODE")
+    monkeypatch.delenv("MAI_ADMIN_CODE", raising=False)
     client = TestClient(secure_app.app)
 
     _, public_one = _new_device()
