@@ -1,0 +1,61 @@
+name: MAI V1.4 one-time reliability patch
+on:
+  push:
+    branches: [ mai-v1.1-tamil ]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mai-v1.1-tamil
+          fetch-depth: 0
+      - name: Apply exact reliability replacements
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('app/src/main/java/com/mai/app/recording/RecordingService.kt')
+          text = path.read_text()
+          replacements = {
+              'private const val MAX_RECONNECT_ATTEMPTS = 3': 'private const val MAX_RECONNECT_ATTEMPTS = 6',
+              'if (attempt > 0) Thread.sleep(300L)': 'if (attempt > 0) Thread.sleep(longArrayOf(0L, 1_000L, 2_000L, 4_000L, 8_000L, 15_000L)[attempt])',
+              '.setBackoffCriteria(androidx.work.BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)': '.setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 15, TimeUnit.SECONDS)',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'Missing expected RecordingService source: {old}')
+              text = text.replace(old, new)
+          path.write_text(text)
+
+          app = Path('backend/app.py')
+          text = app.read_text()
+          old = 'def language_hints() -> list[str]:\n    return ["ta", "en"]'
+          new = 'def language_hints() -> list[str]:\n    # Legacy endpoint remains unbiased; production v2 accepts explicit per-meeting presets.\n    return []'
+          if old not in text:
+              raise SystemExit('Missing legacy language_hints block')
+          app.write_text(text.replace(old, new))
+
+          ui = Path('app/src/main/java/com/mai/app/ui/MaiRoot.kt')
+          text = ui.read_text()
+          old = 'Realtime Tamil + English/Tanglish preview'
+          new = 'Realtime multilingual preview · Auto detect'
+          if old not in text:
+              raise SystemExit('Missing Speech & AI settings label')
+          text = text.replace(old, new)
+          old2 = 'Live transcription is only a preview. The complete saved audio is reprocessed after Stop for the final English transcript and MOM.'
+          new2 = 'Live transcription is only a preview. Auto mode does not force a language. The complete saved audio is processed on the MAI server with resumable multilingual transcription, then converted into the final English transcript and MOM.'
+          if old2 not in text:
+              raise SystemExit('Missing Speech & AI settings description')
+          ui.write_text(text.replace(old2, new2))
+          PY
+      - name: Remove one-time workflow and commit patch
+        run: |
+          rm -f .github/workflows/mai-v14-source-patch.yml
+          git config user.name "MAI CI"
+          git config user.email "actions@users.noreply.github.com"
+          git add app/src/main/java/com/mai/app/recording/RecordingService.kt app/src/main/java/com/mai/app/ui/MaiRoot.kt backend/app.py .github/workflows/mai-v14-source-patch.yml
+          git commit -m "Harden mic reconnect and multilingual auto mode"
+          git push origin HEAD:mai-v1.1-tamil
