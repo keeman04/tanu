@@ -48,8 +48,10 @@ def test_normalize_uses_safe_summary():
     assert result.transcript == "hello"
 
 
-def test_tamil_english_hints_are_always_enabled():
-    assert language_hints() == ["ta", "en"]
+def test_legacy_transcription_is_unbiased_in_auto_mode():
+    # Production V1.4 chooses per-meeting language presets in jobs.py/realtime.py.
+    # The legacy endpoint must no longer bias every recording toward Tamil + English.
+    assert language_hints() == []
 
 
 def test_participant_names_are_high_priority_transcription_keywords():
