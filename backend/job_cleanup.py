@@ -78,13 +78,15 @@ def cleanup_once(now: int | None = None) -> dict[str, int]:
 
 def start_cleanup_loop() -> None:
     def run() -> None:
+        # secure_app performs one synchronous cleanup at startup. Waiting before the first
+        # background pass prevents duplicate startup work and keeps tests deterministic.
         while True:
+            time.sleep(CLEANUP_INTERVAL_SECONDS)
             try:
                 cleanup_once()
             except Exception:
                 # Cleanup must never take the processing API down. The next cycle retries.
                 pass
-            time.sleep(CLEANUP_INTERVAL_SECONDS)
 
     thread = threading.Thread(target=run, name="mai-job-cleanup", daemon=True)
     thread.start()
