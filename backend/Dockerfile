@@ -7,7 +7,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py device_auth.py jobs.py realtime.py secure_app.py ./
+COPY app.py device_auth.py jobs.py job_cleanup.py realtime.py secure_app.py ./
 RUN mkdir -p /data /data/meetings
 
 ENV PYTHONUNBUFFERED=1
