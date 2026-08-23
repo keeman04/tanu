@@ -6,6 +6,7 @@ with per-device session authentication, and adds persistent resumable meeting jo
 
 import app as core
 from device_auth import require_auth, router as auth_router
+from job_cleanup import cleanup_once, start_cleanup_loop
 from jobs import init_job_system, router as jobs_router
 from realtime import router as realtime_router
 
@@ -17,5 +18,7 @@ core.app.include_router(jobs_router)
 core.app.include_router(realtime_router)
 
 init_job_system()
+cleanup_once()
+start_cleanup_loop()
 
 app = core.app
