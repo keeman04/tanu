@@ -28,9 +28,12 @@ class MaiApplication : Application() {
         if (!settings.contains("audio_retention_days")) {
             settings.edit().putInt("audio_retention_days", 7).apply()
         }
+        if (!settings.contains("transcription_language_mode")) {
+            // Auto is deliberately unbiased: the final GPT Transcribe pass can recognize
+            // multilingual/code-switched audio instead of being forced toward Tamil/English.
+            settings.edit().putString("transcription_language_mode", "auto").apply()
+        }
 
-        // A multi-hour interrupted meeting can contain hundreds of 15-second chunks.
-        // Never rebuild those on Android's main/startup thread; MAI must open immediately.
         recoveryExecutor.execute {
             runCatching {
                 val db = MaiDb(this)
@@ -49,7 +52,7 @@ class MaiApplication : Application() {
                     }
                     val summary = when {
                         recoveredAudio == null -> "Meeting was interrupted and MAI could not recover usable audio."
-                        backendConfigured -> "Meeting was interrupted, saved audio was recovered, and MAI is processing the complete recording."
+                        backendConfigured -> "Meeting was interrupted, saved audio was recovered, and MAI is resuming final server processing."
                         else -> "Meeting was interrupted, but the saved audio was recovered safely. Final AI processing is waiting for a configured backend."
                     }
                     db.finishMeeting(
@@ -66,9 +69,6 @@ class MaiApplication : Application() {
                     if (recoveredAudio != null && backendConfigured) enqueueAi(meeting.id)
                 }
 
-                // WorkManager is persistent, but app upgrades/device cleanup can remove a queued
-                // request. Re-enqueue any safely recorded meeting that still needs final processing.
-                // A failed processing job with intact audio is also safe to retry on next launch.
                 if (backendConfigured) {
                     db.listMeetings()
                         .filter { it.status in setOf("processing", "recorded", "processing_failed") }
@@ -92,7 +92,7 @@ class MaiApplication : Application() {
         val request = OneTimeWorkRequestBuilder<AiEnhanceWorker>()
             .setInputData(AiEnhanceWorker.input(meetingId))
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .setBackoffCriteria(androidx.work.BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 15, TimeUnit.SECONDS)
             .build()
         WorkManager.getInstance(this).enqueueUniqueWork("mai-ai-$meetingId", ExistingWorkPolicy.KEEP, request)
     }
