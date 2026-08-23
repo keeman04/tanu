@@ -192,7 +192,7 @@ def main() -> None:
         while time.time() < deadline:
             status = str(state.get("status", ""))
             progress = int(state.get("progress", 0))
-            if (status != last_status:
+            if status != last_status:
                 print(f"JOB {status} {progress}%")
                 last_status = status
             if status == "ready":
