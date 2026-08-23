@@ -17,23 +17,25 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
-def _delete_audio_cache(path_text: str) -> None:
+def _delete_audio_cache(path_text: str) -> bool:
     path = Path(path_text)
-    run_dir = path.parent
+    existed = path.exists() or (path.parent / "work").exists()
     try:
         path.unlink(missing_ok=True)
     except OSError:
         pass
-    shutil.rmtree(run_dir / "work", ignore_errors=True)
+    shutil.rmtree(path.parent / "work", ignore_errors=True)
+    return existed
 
 
 def cleanup_once(now: int | None = None) -> dict[str, int]:
-    """Remove backend audio caches without deleting the final result metadata.
+    """Remove backend audio caches without deleting final result metadata.
 
     Ready jobs lose their server-side audio immediately because Android retains the source
-    according to the user's local retention setting. Failed jobs keep audio for a bounded
-    retry window; when that cache expires, uploaded_bytes is reset to zero so Android can
-    resumably upload the local source again instead of processing a missing file.
+    according to the user's local retention setting. Their expected/uploaded byte metadata
+    deliberately stays intact so a phone fetching a completed job never mistakes cleanup for
+    an interrupted upload. Failed jobs keep audio for a bounded retry window; after expiry,
+    uploaded_bytes resets to zero so Android can resumably upload its preserved local source.
     """
     if not JOB_DB.exists():
         return {"ready_audio_deleted": 0, "retry_caches_reset": 0}
@@ -42,15 +44,11 @@ def cleanup_once(now: int | None = None) -> dict[str, int]:
     retry_reset = 0
     with _connect() as connection:
         ready = connection.execute(
-            "SELECT job_id,audio_path FROM jobs WHERE status='ready' AND uploaded_bytes>0"
+            "SELECT job_id,audio_path FROM jobs WHERE status='ready'"
         ).fetchall()
         for row in ready:
-            _delete_audio_cache(str(row["audio_path"]))
-            connection.execute(
-                "UPDATE jobs SET uploaded_bytes=0, updated_at=? WHERE job_id=?",
-                (now, str(row["job_id"])),
-            )
-            ready_deleted += 1
+            if _delete_audio_cache(str(row["audio_path"])):
+                ready_deleted += 1
 
         stale = connection.execute(
             """
