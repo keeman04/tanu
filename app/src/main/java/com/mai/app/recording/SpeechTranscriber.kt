@@ -24,9 +24,6 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * Realtime transcript is a live preview only. The saved AAC recording is always the
  * authoritative source for the final transcript and MOM.
- *
- * Android records at 16 kHz for durable AAC storage. OpenAI Realtime transcription uses
- * 24 kHz PCM, so only the mirrored live stream is resampled to 24 kHz here.
  */
 class SpeechTranscriber(
     context: Context,
@@ -37,12 +34,29 @@ class SpeechTranscriber(
 ) : Closeable {
     companion object {
         private const val LIVE_RATE = 24_000
-        private const val MAX_BUFFER_BYTES = LIVE_RATE * 2 * 60 // 60 seconds PCM16
+        private const val MAX_BUFFER_BYTES = LIVE_RATE * 2 * 60
         private val RECONNECT_DELAYS_MS = longArrayOf(1_000, 2_000, 4_000, 8_000, 15_000)
     }
 
     private val appContext = context.applicationContext
     private val auth = MaiDeviceAuth(appContext)
+    private val languageMode = appContext.getSharedPreferences("mai_settings", Context.MODE_PRIVATE)
+        .getString("transcription_language_mode", "auto")
+        ?.takeIf { it.isNotBlank() }
+        ?: "auto"
+    private val languageCodes: List<String> = when (languageMode) {
+        "ta_en" -> listOf("ta", "en")
+        "hi_en" -> listOf("hi", "en")
+        "te_en" -> listOf("te", "en")
+        "ml_en" -> listOf("ml", "en")
+        "kn_en" -> listOf("kn", "en")
+        "bn_en" -> listOf("bn", "en")
+        "mr_en" -> listOf("mr", "en")
+        "gu_en" -> listOf("gu", "en")
+        "pa_en" -> listOf("pa", "en")
+        "ur_en" -> listOf("ur", "en")
+        else -> emptyList()
+    }
     private val names: List<String> = participantNames.ifEmpty {
         runCatching {
             MaiDb(appContext).listMeetings()
@@ -110,9 +124,10 @@ class SpeechTranscriber(
             val sessionToken = auth.sessionToken()
             val payload = JSONObject()
                 .put("participants", JSONArray().apply { names.forEach { put(it) } })
+                .put("language_mode", languageMode)
                 .toString()
             val request = Request.Builder()
-                .url("$base/v1/realtime/client-secret")
+                .url("$base/v1/realtime/client-secret-v2")
                 .post(payload.toRequestBody("application/json".toMediaType()))
                 .header("Accept", "application/json")
                 .header("Authorization", "Bearer $sessionToken")
@@ -148,6 +163,21 @@ class SpeechTranscriber(
                     return
                 }
                 reconnectAttempt.set(0)
+                val transcription = JSONObject()
+                    .put("model", "gpt-live-transcribe")
+                    .put("keywords", JSONArray().apply {
+                        names.take(20).forEach { name ->
+                            val clean = name.replace("\n", " ").replace("\r", " ")
+                                .replace("<", "").replace(">", "").trim()
+                            if (clean.isNotBlank()) put(clean)
+                        }
+                        listOf("MAI", "VGP", "Marine Kingdom", "Universal Kingdom", "Waghoba", "Rednote", "WhatsApp").forEach { put(it) }
+                    })
+                    .put("delay", "high")
+                if (languageCodes.isNotEmpty()) {
+                    transcription.put("languages", JSONArray().apply { languageCodes.forEach { put(it) } })
+                }
+
                 val session = JSONObject()
                     .put("type", "session.update")
                     .put(
@@ -161,21 +191,7 @@ class SpeechTranscriber(
                                     JSONObject()
                                         .put("format", JSONObject().put("type", "audio/pcm").put("rate", LIVE_RATE))
                                         .put("noise_reduction", JSONObject().put("type", "far_field"))
-                                        .put(
-                                            "transcription",
-                                            JSONObject()
-                                                .put("model", "gpt-live-transcribe")
-                                                .put("languages", JSONArray().put("ta").put("en"))
-                                                .put("keywords", JSONArray().apply {
-                                                    names.take(20).forEach { name ->
-                                                        val clean = name.replace("\n", " ").replace("\r", " ")
-                                                            .replace("<", "").replace(">", "").trim()
-                                                        if (clean.isNotBlank()) put(clean)
-                                                    }
-                                                    listOf("MAI", "VGP", "Marine Kingdom", "Universal Kingdom", "Waghoba", "Rednote", "WhatsApp").forEach { put(it) }
-                                                })
-                                                .put("delay", "high")
-                                        )
+                                        .put("transcription", transcription)
                                         .put(
                                             "turn_detection",
                                             JSONObject()
@@ -205,7 +221,6 @@ class SpeechTranscriber(
                             partialText += json.optString("delta")
                             onUpdate(finalText.toString().trim(), partialText.trim())
                         }
-
                         "conversation.item.input_audio_transcription.completed" -> synchronized(lock) {
                             val piece = json.optString("transcript").trim()
                             if (piece.isNotBlank()) {
@@ -216,7 +231,6 @@ class SpeechTranscriber(
                             onUpdate(finalText.toString().trim(), "")
                             if (awaitingFinalCommit.compareAndSet(true, false)) finalCommitLatch.countDown()
                         }
-
                         "error" -> {
                             val message = json.optJSONObject("error")?.optString("message")
                                 ?: json.optString("message", "Realtime transcription error")
