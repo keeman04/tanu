@@ -66,16 +66,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Backend unit tests
+      - name: Backend architecture and unit tests
         working-directory: backend
         run: |
           pip install -q -r requirements.txt
           PYTHONPATH=. pytest -q
-          python -m py_compile app.py device_auth.py secure_app.py
+          python -m py_compile app.py device_auth.py jobs.py realtime.py secure_app.py e2e_certify.py
       - name: Upload certified APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.3.1-Final-Candidate
+          name: MAI-V1.4.0-Final-Candidate
           path: app/build/outputs/apk/qa/app-qa.apk
           retention-days: 30
           if-no-files-found: error
