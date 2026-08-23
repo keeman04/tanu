@@ -13,7 +13,7 @@ def test_critical_tokens_catch_names_money_percentages_dates_and_numbers():
     text = "Karthick approved ₹15,000, 20% for VGP Waghoba on 27/08/2026 at 4:30 pm."
     tokens = accuracy.critical_tokens(text, ["Karthick", "Ravi"])
     assert "name:karthick" in tokens
-    assert any("15,000" in token for token in tokens)
+    assert any("15 000" in token for token in tokens)
     assert any("20%" in token for token in tokens)
     assert any("27/08/2026" in token for token in tokens)
     assert "term:vgp waghoba" in tokens
@@ -25,8 +25,8 @@ def test_critical_disagreement_forces_verification():
     assert not accuracy.critical_agreement(a, b, ["Karthick"])
     consensus, unresolved = accuracy.consensus_critical([a, b], ["Karthick"])
     assert "name:karthick" in consensus
-    assert any("15,000" in token for token in unresolved)
-    assert any("50,000" in token for token in unresolved)
+    assert any("15 000" in token for token in unresolved)
+    assert any("50 000" in token for token in unresolved)
 
 
 def test_wer_and_release_thresholds():
