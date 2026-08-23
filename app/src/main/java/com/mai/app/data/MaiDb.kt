@@ -30,10 +30,11 @@ data class MeetingRecord(
     val actions: List<ActionRecord>,
     val audioPath: String?,
     val audioExpiresAt: Long?,
-    val status: String
+    val status: String,
+    val aiJobId: String? = null
 )
 
-class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
+class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 3) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """
@@ -49,13 +50,18 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
                 actions TEXT NOT NULL DEFAULT '[]',
                 audio_path TEXT,
                 audio_expires_at INTEGER,
-                status TEXT NOT NULL DEFAULT 'recording'
+                status TEXT NOT NULL DEFAULT 'recording',
+                ai_job_id TEXT
             )
             """.trimIndent()
         )
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE meetings ADD COLUMN ai_job_id TEXT")
+        }
+    }
 
     fun createMeeting(title: String, participants: List<Participant>, startedAt: Long = System.currentTimeMillis()): String {
         require(participants.isNotEmpty()) { "At least one participant is required" }
@@ -92,7 +98,8 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
         decisions: List<String>,
         actions: List<ActionRecord>,
         audioPath: String?,
-        audioExpiresAt: Long?
+        audioExpiresAt: Long?,
+        status: String = "ready"
     ) {
         writableDatabase.update("meetings", ContentValues().apply {
             put("ended_at", endedAt)
@@ -102,7 +109,20 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
             put("actions", actionsToJson(actions))
             if (audioPath == null) putNull("audio_path") else put("audio_path", audioPath)
             if (audioExpiresAt == null) putNull("audio_expires_at") else put("audio_expires_at", audioExpiresAt)
-            put("status", "ready")
+            put("status", status)
+        }, "id=?", arrayOf(id))
+    }
+
+    fun updateStatus(id: String, status: String, summary: String? = null) {
+        writableDatabase.update("meetings", ContentValues().apply {
+            put("status", status)
+            if (summary != null) put("summary", summary)
+        }, "id=?", arrayOf(id))
+    }
+
+    fun setAiJobId(id: String, jobId: String?) {
+        writableDatabase.update("meetings", ContentValues().apply {
+            if (jobId.isNullOrBlank()) putNull("ai_job_id") else put("ai_job_id", jobId)
         }, "id=?", arrayOf(id))
     }
 
@@ -177,6 +197,7 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
 
     private fun fromCursor(c: Cursor): MeetingRecord {
         fun idx(name: String) = c.getColumnIndexOrThrow(name)
+        val jobIndex = c.getColumnIndex("ai_job_id")
         return MeetingRecord(
             id = c.getString(idx("id")),
             title = c.getString(idx("title")),
@@ -189,7 +210,8 @@ class MaiDb(context: Context) : SQLiteOpenHelper(context, "mai.db", null, 2) {
             actions = actionsFromJson(c.getString(idx("actions"))),
             audioPath = if (c.isNull(idx("audio_path"))) null else c.getString(idx("audio_path")),
             audioExpiresAt = if (c.isNull(idx("audio_expires_at"))) null else c.getLong(idx("audio_expires_at")),
-            status = c.getString(idx("status"))
+            status = c.getString(idx("status")),
+            aiJobId = if (jobIndex < 0 || c.isNull(jobIndex)) null else c.getString(jobIndex)
         )
     }
 

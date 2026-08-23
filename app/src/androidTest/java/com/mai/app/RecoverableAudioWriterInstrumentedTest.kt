@@ -57,4 +57,46 @@ class RecoverableAudioWriterInstrumentedTest {
         assertFalse(chunkDir.exists())
         recovered.delete()
     }
+
+    @Test
+    fun newEncoderForSameMeetingPreservesAudioFromPreviousServiceLifetime() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val pcm = ByteArray(8_192) { index -> ((index * 11) and 0x6F).toByte() }
+
+        val baselineId = "baseline-${UUID.randomUUID()}"
+        val baselineWriter = RecoverableAudioWriter(context, baselineId)
+        repeat(35) {
+            baselineWriter.writePcm(pcm, pcm.size)
+            if (it % 6 == 0) baselineWriter.checkpoint()
+        }
+        val baseline = baselineWriter.finalizeFile(context)
+        assertNotNull(baseline)
+        val oneLifetimeBytes = baseline!!.length()
+        assertTrue(oneLifetimeBytes > 512L)
+        baseline.delete()
+
+        val id = "restart-${UUID.randomUUID()}"
+        val firstLifetime = RecoverableAudioWriter(context, id)
+        repeat(35) {
+            firstLifetime.writePcm(pcm, pcm.size)
+            if (it % 6 == 0) firstLifetime.checkpoint()
+        }
+        // A real process death does not finalize the meeting. close() models the codec/chunk
+        // boundary while intentionally leaving the meeting unfinished for the next writer.
+        firstLifetime.close()
+
+        val secondLifetime = RecoverableAudioWriter(context, id)
+        repeat(35) {
+            secondLifetime.writePcm(pcm, pcm.size)
+            if (it % 6 == 0) secondLifetime.checkpoint()
+        }
+        val combined = secondLifetime.finalizeFile(context)
+        assertNotNull(combined)
+        assertTrue(combined!!.isFile)
+        // The final AAC must contain materially more than a single lifetime, proving the
+        // second encoder did not erase the chunks produced before the restart.
+        assertTrue(combined.length() > (oneLifetimeBytes * 3L / 2L))
+        assertFalse(RecoverableAudioWriter.chunkDirectory(context, id).exists())
+        combined.delete()
+    }
 }

@@ -1,7 +1,7 @@
 name: MAI Android
 on:
   push:
-    branches: [ main, mai-production, fix-launch-icon-crash, mai-v1-hardening ]
+    branches: [ main, mai-production, fix-launch-icon-crash, mai-v1-hardening, mai-v1.1-tamil ]
   pull_request:
     branches: [ main ]
 
@@ -29,13 +29,50 @@ jobs:
         run: gradle --no-daemon testDebugUnitTest
       - name: Android lint
         run: gradle --no-daemon lintDebug
-      - name: Build APK
-        run: gradle --no-daemon assembleDebug
+      - name: Reject shared backend secrets in Android
+        run: |
+          if grep -R "MAI_GATEWAY_TOKEN" app/src app/build.gradle.kts; then
+            echo "::error::Shared MAI gateway token must never be compiled into the APK."
+            exit 1
+          fi
+          echo "Android uses per-device Keystore authentication; no shared gateway token source found."
+      - name: Check MAI backend configuration
+        env:
+          MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
+        run: |
+          if [ -n "$MAI_BACKEND_URL" ]; then
+            echo "MAI backend URL is configured for this APK. Device activation will be required."
+          else
+            echo "::warning::MAI_BACKEND_URL is not configured. Recording works, but final multilingual AI processing remains pending."
+          fi
+      - name: Build hardened QA APK
+        env:
+          MAI_BACKEND_URL: ${{ secrets.MAI_BACKEND_URL }}
+        run: gradle --no-daemon assembleQa -PMAI_BACKEND_URL="$MAI_BACKEND_URL"
+      - name: Reject oversized APK regressions
+        run: |
+          APK=app/build/outputs/apk/qa/app-qa.apk
+          SIZE=$(stat -c%s "$APK")
+          MAX=$((50 * 1024 * 1024))
+          echo "APK size: $SIZE bytes"
+          if [ "$SIZE" -gt "$MAX" ]; then
+            echo "::error::APK is larger than 50 MiB. Check for accidentally packaged speech models/native assets."
+            exit 1
+          fi
+      - name: Ensure Vosk model is not packaged
+        run: |
+          APK=app/build/outputs/apk/qa/app-qa.apk
+          if unzip -l "$APK" | grep -Eiq 'vosk|model-en-us'; then
+            echo "::error::Unused Vosk/English speech model is still packaged."
+            exit 1
+          fi
+          echo "No Vosk speech model found in APK."
       - name: Validate 16 KiB arm64 native alignment
         run: |
+          APK=app/build/outputs/apk/qa/app-qa.apk
           rm -rf /tmp/mai-apk-check
           mkdir -p /tmp/mai-apk-check
-          unzip -q app/build/outputs/apk/debug/app-debug.apk 'lib/arm64-v8a/*.so' -d /tmp/mai-apk-check
+          unzip -q "$APK" 'lib/arm64-v8a/*.so' -d /tmp/mai-apk-check || true
           python3 - <<'PY'
           import glob, subprocess, sys
           bad = []
@@ -53,13 +90,13 @@ jobs:
               for path, align in bad:
                   print(f'  {path}: {align}')
               sys.exit(1)
-          print('All arm64 native LOAD segments are at least 16 KiB aligned.')
+          print('All packaged arm64 native LOAD segments are at least 16 KiB aligned.')
           PY
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MAI-V1.0.0-Android
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: MAI-V1.4.1-Verified-Multilingual-QA
+          path: app/build/outputs/apk/qa/app-qa.apk
           retention-days: 30
           if-no-files-found: error
 
@@ -80,8 +117,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Backend unit tests
         run: PYTHONPATH=. pytest -q
-      - name: Validate backend module
-        run: python -m py_compile app.py
+      - name: Validate backend modules
+        run: python -m py_compile app.py device_auth.py jobs.py job_cleanup.py job_segmentation.py accuracy.py accuracy_metrics.py multilingual_benchmark.py realtime.py secure_app.py e2e_certify.py
 
   cold-start-smoke:
     strategy:

@@ -1,0 +1,15 @@
+{$MAI_DOMAIN} {
+    encode zstd gzip
+
+    request_body {
+        max_size 200MB
+    }
+
+    reverse_proxy mai-backend:8080 {
+        transport http {
+            read_timeout 45m
+            write_timeout 45m
+            dial_timeout 30s
+        }
+    }
+}

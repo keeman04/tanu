@@ -7,8 +7,14 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
+COPY app.py device_auth.py jobs.py job_cleanup.py job_segmentation.py accuracy.py realtime.py secure_app.py ./
+RUN mkdir -p /data /data/meetings
 
 ENV PYTHONUNBUFFERED=1
+ENV MAI_AUTH_DB=/data/mai-auth.sqlite3
+ENV MAI_JOB_DB=/data/mai-jobs.sqlite3
+ENV MAI_JOB_ROOT=/data/meetings
+ENV MAI_ACCURACY_MODE=verified
+ENV MAI_VERIFY_STT_MODEL=gpt-4o-transcribe
 EXPOSE 8080
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "secure_app:app", "--host", "0.0.0.0", "--port", "8080"]

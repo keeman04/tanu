@@ -19,9 +19,9 @@ class MomEngineTest {
         assertTrue(result.decisions.isNotEmpty())
     }
 
-    @Test fun emptyTranscriptProducesSafeMom() {
+    @Test fun emptyTranscriptProducesNoInventedMom() {
         val result = MomEngine.generate("", emptyList(), start)
-        assertTrue(result.summary.contains("No live transcript", ignoreCase = true))
+        assertTrue(result.summary.contains("pending multilingual processing", ignoreCase = true))
         assertTrue(result.decisions.isEmpty())
         assertTrue(result.actions.isEmpty())
     }
