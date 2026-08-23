@@ -7,12 +7,14 @@ with per-device session authentication, and adds persistent resumable meeting jo
 import app as core
 from device_auth import require_auth, router as auth_router
 from jobs import init_job_system, router as jobs_router
+from realtime import router as realtime_router
 
 # Existing endpoint functions resolve require_auth from the app module at call time, so this
 # assignment upgrades legacy endpoints without duplicating their stable behavior.
 core.require_auth = require_auth
 core.app.include_router(auth_router)
 core.app.include_router(jobs_router)
+core.app.include_router(realtime_router)
 
 init_job_system()
 
