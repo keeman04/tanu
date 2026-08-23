@@ -48,6 +48,7 @@ class RecordingService : Service() {
         private const val UI_UPDATE_MS = 100L
         private const val NOTIFICATION_UPDATE_MS = 1_000L
         private const val MAX_RECONNECT_ATTEMPTS = 6
+        private val RECONNECT_DELAYS_MS = longArrayOf(0L, 1_000L, 2_000L, 4_000L, 8_000L, 15_000L)
     }
 
     private val running = AtomicBoolean(false)
@@ -71,6 +72,7 @@ class RecordingService : Service() {
                 ACTION_START -> if (!running.get()) startRecording(intent.getStringExtra(EXTRA_MEETING_ID))
             }
         } catch (t: Throwable) {
+            meetingId?.let { RecordingRestartGuard.clear(this, it) }
             RecordingBus.update {
                 it.copy(active = false, status = "error", error = t.message ?: "Unable to start recording")
             }
@@ -78,7 +80,11 @@ class RecordingService : Service() {
             runCatching { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) }
             stopSelf()
         }
-        return START_NOT_STICKY
+
+        // A foreground recording that is killed for memory pressure should receive the
+        // original START intent again. RecoverableAudioWriter preserves the previous AAC
+        // before a fresh encoder is opened, so redelivery cannot overwrite earlier audio.
+        return if (running.get()) START_REDELIVER_INTENT else START_NOT_STICKY
     }
 
     private fun startRecording(id: String?) {
@@ -88,13 +94,30 @@ class RecordingService : Service() {
             return
         }
         RecordingPreflight.blockingIssue(this)?.let { issue ->
+            RecordingRestartGuard.clear(this, id)
             RecordingBus.update { it.copy(active = false, meetingId = id, status = "error", error = issue) }
             stopSelf()
             return
         }
 
+        val existingMeeting = runCatching { MaiDb(this).getMeeting(id) }.getOrNull()
+        if (existingMeeting == null || existingMeeting.status != "recording") {
+            RecordingRestartGuard.clear(this, id)
+            RecordingBus.update {
+                it.copy(
+                    active = false,
+                    meetingId = id,
+                    status = "error",
+                    error = "This meeting is no longer in an active recording state."
+                )
+            }
+            stopSelf()
+            return
+        }
+
         meetingId = id
-        startedAt = System.currentTimeMillis()
+        startedAt = existingMeeting.startedAt
+        RecordingRestartGuard.markActive(this, id)
 
         val serviceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
@@ -102,7 +125,7 @@ class RecordingService : Service() {
         ServiceCompat.startForeground(
             this,
             NOTIFICATION_ID,
-            notification("Starting microphone", 0L),
+            notification("Starting microphone", System.currentTimeMillis() - startedAt),
             serviceType
         )
 
@@ -186,6 +209,7 @@ class RecordingService : Service() {
             buffer = ByteArray(opened.second)
             activeAudio = audio
             health = installHealthMonitor(audio)
+            RecordingRestartGuard.heartbeat(this, id)
             RecordingBus.update { it.copy(active = true, status = "recording", error = null) }
 
             while (running.get()) {
@@ -206,6 +230,7 @@ class RecordingService : Service() {
                         lastCheckpoint = now
                         writer.checkpoint()
                         db.checkpointMeeting(id, combinedTranscript(), writer.recoveryPath)
+                        RecordingRestartGuard.heartbeat(this, id)
                     }
 
                     if (now - lastStorageCheck >= STORAGE_CHECK_MS) {
@@ -266,7 +291,8 @@ class RecordingService : Service() {
                         var replacement: Pair<AudioRecord, Int>? = null
                         repeat(MAX_RECONNECT_ATTEMPTS) { attempt ->
                             if (replacement == null && running.get()) {
-                                if (attempt > 0) Thread.sleep(longArrayOf(0L, 1_000L, 2_000L, 4_000L, 8_000L, 15_000L)[attempt])
+                                val delay = RECONNECT_DELAYS_MS.getOrElse(attempt) { RECONNECT_DELAYS_MS.last() }
+                                if (delay > 0L) Thread.sleep(delay)
                                 replacement = runCatching { openMicrophone() }.getOrNull()
                             }
                         }
@@ -276,6 +302,7 @@ class RecordingService : Service() {
                         activeAudio = audio
                         health = installHealthMonitor(audio!!)
                         consecutiveReadErrors = 0
+                        RecordingRestartGuard.heartbeat(this, id)
                         RecordingBus.update { old ->
                             old.copy(status = "recording", interruption = "Microphone reconnected. Recording continued.")
                         }
@@ -415,6 +442,7 @@ class RecordingService : Service() {
                 interruption = if (failure != null && finalPath != null) "Recording interruption recovered; final audio is safe." else it.interruption
             )
         }
+        RecordingRestartGuard.clear(this, id)
         releaseWakeLock()
         runCatching { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) }
         stopSelf()
@@ -442,6 +470,9 @@ class RecordingService : Service() {
 
     override fun onDestroy() {
         // onDestroy is an emergency/lifecycle teardown path, not the normal Stop path.
+        // Do not clear RecordingRestartGuard here: if Android killed this service while an
+        // active meeting existed, START_REDELIVER_INTENT needs the marker to distinguish a
+        // restart from a genuinely abandoned recording.
         if (running.compareAndSet(true, false)) {
             runCatching { activeAudio?.stop() }
             thread?.interrupt()
