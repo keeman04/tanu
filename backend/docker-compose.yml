@@ -6,6 +6,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       MAI_ADMIN_CODE: ${MAI_ADMIN_CODE}
       MAI_AUTH_DB: /data/mai-auth.sqlite3
+      MAI_JOB_DB: /data/mai-jobs.sqlite3
+      MAI_JOB_ROOT: /data/meetings
       MAI_SESSION_TTL_SECONDS: ${MAI_SESSION_TTL_SECONDS:-900}
       MAI_ACTIVATION_TTL_SECONDS: ${MAI_ACTIVATION_TTL_SECONDS:-86400}
       MAI_STT_MODEL: ${MAI_STT_MODEL:-gpt-transcribe}
@@ -13,12 +15,16 @@ services:
       MAI_LIVE_STT_MODEL: ${MAI_LIVE_STT_MODEL:-gpt-live-transcribe}
       MAI_TRANSLATE_MODEL: ${MAI_TRANSLATE_MODEL:-gpt-5.6-terra}
       MAI_MOM_MODEL: ${MAI_MOM_MODEL:-gpt-5.6-sol}
-      MAI_SEGMENT_SECONDS: ${MAI_SEGMENT_SECONDS:-480}
-      MAI_STT_WORKERS: ${MAI_STT_WORKERS:-4}
-      MAI_DIARIZE_WORKERS: ${MAI_DIARIZE_WORKERS:-3}
-      MAI_TRANSLATE_WORKERS: ${MAI_TRANSLATE_WORKERS:-4}
+      MAI_SEGMENT_SECONDS: ${MAI_SEGMENT_SECONDS:-420}
+      MAI_SEGMENT_OVERLAP_SECONDS: ${MAI_SEGMENT_OVERLAP_SECONDS:-5}
+      MAI_UPLOAD_CHUNK_BYTES: ${MAI_UPLOAD_CHUNK_BYTES:-5242880}
+      MAI_MAX_AUDIO_BYTES: ${MAI_MAX_AUDIO_BYTES:-209715200}
+      MAI_JOB_WORKERS: ${MAI_JOB_WORKERS:-2}
+      MAI_STT_WORKERS: ${MAI_STT_WORKERS:-3}
+      MAI_DIARIZE_WORKERS: ${MAI_DIARIZE_WORKERS:-2}
+      MAI_TRANSLATE_WORKERS: ${MAI_TRANSLATE_WORKERS:-3}
     volumes:
-      - mai-auth:/data
+      - mai-data:/data
     expose:
       - "8080"
 
@@ -39,6 +45,6 @@ services:
       - caddy-config:/config
 
 volumes:
-  mai-auth:
+  mai-data:
   caddy-data:
   caddy-config:
