@@ -31,9 +31,9 @@ class MicHealthMonitor(
             if (nowSilenced != previous) {
                 onEvent(
                     if (nowSilenced) {
-                        "Microphone temporarily interrupted by a call or another app. MAI is preserving the meeting."
+                        "Microphone temporarily unavailable because a call or another app has capture priority. Audio during this interruption cannot be captured; MAI will resume automatically when Android restores the mic."
                     } else {
-                        "Microphone restored. Recording has resumed."
+                        "Microphone restored. MAI resumed recording automatically."
                     },
                     nowSilenced
                 )
@@ -42,6 +42,10 @@ class MicHealthMonitor(
     }
 
     init {
+        AudioInputPolicy.apply(context, recorder)?.let { preferred ->
+            onEvent("Using $preferred for this meeting.", false)
+        }
+        lastRouteKey = routeKey(recorder.routedDevice)
         runCatching {
             audioManager.registerAudioRecordingCallback(callback, Handler(Looper.getMainLooper()))
             registered = true
@@ -57,7 +61,7 @@ class MicHealthMonitor(
         if (key == previous) return null
         lastRouteKey = key
         if (previous == null) return null
-        return "Audio input changed to ${routeLabel(device)}. Recording continued."
+        return "Audio input changed to ${AudioInputPolicy.label(device)}. MAI continued recording on the active Android input."
     }
 
     override fun close() {
@@ -65,19 +69,5 @@ class MicHealthMonitor(
         registered = false
     }
 
-    private fun routeKey(device: AudioDeviceInfo?): String? =
-        device?.let { "${it.id}:${it.type}" }
-
-    private fun routeLabel(device: AudioDeviceInfo?): String = when (device?.type) {
-        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth"
-        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth"
-        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "wired headset"
-        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired headphones"
-        AudioDeviceInfo.TYPE_USB_DEVICE,
-        AudioDeviceInfo.TYPE_USB_HEADSET,
-        AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USB audio"
-        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "phone microphone"
-        null -> "microphone"
-        else -> device.productName?.toString()?.takeIf { it.isNotBlank() } ?: "microphone"
-    }
+    private fun routeKey(device: AudioDeviceInfo?): String? = device?.let { "${it.id}:${it.type}" }
 }
