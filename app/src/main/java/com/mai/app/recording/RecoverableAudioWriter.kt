@@ -8,11 +8,14 @@ import java.io.Closeable
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 
 /**
- * Uses one continuous AAC encoder for the whole meeting while rotating only the ADTS
- * output file every ~15 seconds. This avoids codec restart gaps while keeping each chunk
- * independently recoverable after a process/device interruption.
+ * Uses one continuous AAC encoder per service lifetime while rotating ADTS output every
+ * ~15 seconds. If Android kills and redelivers the recording service, already committed
+ * audio is moved into a crash-safe carry file before a fresh encoder is created. Finalize
+ * concatenates the carry + current encoder output, so process restart never overwrites the
+ * earlier part of the meeting.
  */
 class RecoverableAudioWriter(
     context: Context,
@@ -24,12 +27,25 @@ class RecoverableAudioWriter(
         private const val PCM_BYTES_PER_SAMPLE = 2L
         private const val CHUNK_SECONDS = 15L
 
+        private data class CarryState(
+            val committedLength: Long,
+            val consumedLength: Long,
+            val consumedModified: Long
+        )
+
         fun chunkDirectory(context: Context, meetingId: String): File =
             File(File(context.filesDir, "audio"), "$meetingId.chunks")
 
         fun finalFile(context: Context, meetingId: String): File =
             File(File(context.filesDir, "audio"), "$meetingId.aac")
 
+        private fun carryFile(context: Context, meetingId: String): File =
+            File(File(context.filesDir, "audio"), "$meetingId.carry.aac")
+
+        private fun carryStateFile(context: Context, meetingId: String): File =
+            File(File(context.filesDir, "audio"), "$meetingId.carry.state")
+
+        /** Recover valid ADTS frames from checkpoint chunks into the normal final path. */
         fun recover(context: Context, meetingId: String): File? {
             val root = File(context.filesDir, "audio").apply { mkdirs() }
             val chunks = chunkDirectory(context, meetingId)
@@ -74,6 +90,133 @@ class RecoverableAudioWriter(
             return final.takeIf { it.isFile && it.length() > 0L }
         }
 
+        /**
+         * Called before a new encoder starts. Existing final audio is absorbed first, then
+         * any newer checkpoint chunks are recovered and absorbed. A small sidecar records
+         * the fsynced carry length so a process death during append can be rolled back and
+         * retried without duplication or truncation.
+         */
+        private fun preserveExistingBeforeEncoder(context: Context, meetingId: String) {
+            val root = File(context.filesDir, "audio").apply { mkdirs() }
+            normalizeCarry(context, meetingId)
+
+            finalFile(context, meetingId)
+                .takeIf { it.isFile && it.length() > 0L }
+                ?.let { absorbIntoCarry(context, meetingId, it) }
+
+            if (chunkDirectory(context, meetingId).exists()) {
+                recover(context, meetingId)?.let { absorbIntoCarry(context, meetingId, it) }
+            }
+            root.mkdirs()
+        }
+
+        private fun normalizeCarry(context: Context, meetingId: String): CarryState {
+            val carry = carryFile(context, meetingId)
+            val stateFile = carryStateFile(context, meetingId)
+            val state = readCarryState(stateFile)
+            if (!carry.exists()) {
+                if (stateFile.exists()) stateFile.delete()
+                return CarryState(0L, 0L, 0L)
+            }
+
+            // A carry without a sidecar can only be an interrupted first append from this
+            // implementation. No bytes were committed yet, so discard the partial append.
+            if (state == null) {
+                runCatching { RandomAccessFile(carry, "rw").use { it.setLength(0L) } }
+                val reset = CarryState(0L, 0L, 0L)
+                writeCarryState(stateFile, reset)
+                return reset
+            }
+
+            val safeLength = state.committedLength.coerceIn(0L, carry.length())
+            if (carry.length() != safeLength) {
+                runCatching { RandomAccessFile(carry, "rw").use { it.setLength(safeLength) } }
+            }
+            return state.copy(committedLength = safeLength)
+        }
+
+        private fun absorbIntoCarry(context: Context, meetingId: String, recovered: File) {
+            if (!recovered.isFile || recovered.length() <= 0L) return
+            val carry = carryFile(context, meetingId)
+            val stateFile = carryStateFile(context, meetingId)
+            var state = normalizeCarry(context, meetingId)
+            if (!stateFile.exists()) {
+                writeCarryState(stateFile, state)
+            }
+
+            val signatureLength = recovered.length()
+            val signatureModified = recovered.lastModified()
+            val alreadyCommitted =
+                state.consumedLength == signatureLength &&
+                    state.consumedModified == signatureModified &&
+                    carry.isFile && carry.length() == state.committedLength
+
+            if (!alreadyCommitted) {
+                FileInputStream(recovered).use { input ->
+                    FileOutputStream(carry, true).use { output ->
+                        input.copyTo(output)
+                        output.flush()
+                        runCatching { output.fd.sync() }
+                    }
+                }
+                state = CarryState(carry.length(), signatureLength, signatureModified)
+                writeCarryState(stateFile, state)
+            }
+
+            // Delete only after the carry length + source signature have been committed.
+            // If the process dies before this point, the next startup recognizes the same
+            // source signature and will not append it twice.
+            if (recovered.delete()) {
+                writeCarryState(stateFile, state.copy(consumedLength = 0L, consumedModified = 0L))
+            }
+        }
+
+        private fun finishCarry(context: Context, meetingId: String): File? {
+            val carry = carryFile(context, meetingId)
+            val final = finalFile(context, meetingId)
+            val stateFile = carryStateFile(context, meetingId)
+            normalizeCarry(context, meetingId)
+            if (!carry.isFile || carry.length() <= 0L) {
+                stateFile.delete()
+                return final.takeIf { it.isFile && it.length() > 0L }
+            }
+
+            if (final.exists()) final.delete()
+            if (!carry.renameTo(final)) {
+                FileInputStream(carry).use { input ->
+                    FileOutputStream(final).use { output ->
+                        input.copyTo(output)
+                        output.flush()
+                        runCatching { output.fd.sync() }
+                    }
+                }
+                carry.delete()
+            }
+            stateFile.delete()
+            return final.takeIf { it.isFile && it.length() > 0L }
+        }
+
+        private fun readCarryState(file: File): CarryState? = runCatching {
+            val parts = file.readText().trim().split('|')
+            if (parts.size != 3) return@runCatching null
+            CarryState(parts[0].toLong(), parts[1].toLong(), parts[2].toLong())
+        }.getOrNull()
+
+        private fun writeCarryState(file: File, state: CarryState) {
+            file.parentFile?.mkdirs()
+            val temp = File(file.parentFile, file.name + ".tmp")
+            FileOutputStream(temp).use { output ->
+                output.write("${state.committedLength}|${state.consumedLength}|${state.consumedModified}".toByteArray())
+                output.flush()
+                runCatching { output.fd.sync() }
+            }
+            if (file.exists()) file.delete()
+            if (!temp.renameTo(file)) {
+                temp.copyTo(file, overwrite = true)
+                temp.delete()
+            }
+        }
+
         private fun copyValidAdtsFrames(source: File, output: FileOutputStream): Long {
             val data = runCatching { source.readBytes() }.getOrDefault(ByteArray(0))
             var offset = 0
@@ -99,6 +242,7 @@ class RecoverableAudioWriter(
 
     private val appContext = context.applicationContext
     private val chunkDir = chunkDirectory(appContext, meetingId).apply {
+        preserveExistingBeforeEncoder(appContext, meetingId)
         deleteRecursively()
         mkdirs()
     }
@@ -110,7 +254,7 @@ class RecoverableAudioWriter(
     private var currentPart: File? = null
     private var output: FileOutputStream? = null
     private var closed = false
-    @Volatile private var checkpointed = false
+    @Volatile private var checkpointed = carryFile(appContext, meetingId).let { it.isFile && it.length() > 512L }
 
     init {
         finalFile(appContext, meetingId).delete()
@@ -147,8 +291,6 @@ class RecoverableAudioWriter(
             drain(end = false, timeoutUs = 0L)
 
             if (pcmBytesInChunk >= targetPcmBytes) {
-                // Wait briefly for already-queued AAC frames before switching the file.
-                // The encoder itself stays running continuously.
                 drain(end = false, timeoutUs = 10_000L)
                 commitChunk(openNext = true)
             }
@@ -165,7 +307,8 @@ class RecoverableAudioWriter(
 
     fun finalizeFile(context: Context): File? {
         close()
-        return recover(context, meetingId)
+        recover(context, meetingId)?.let { absorbIntoCarry(context, meetingId, it) }
+        return finishCarry(context, meetingId)
     }
 
     override fun close() {
