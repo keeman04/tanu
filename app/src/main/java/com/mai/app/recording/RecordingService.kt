@@ -47,7 +47,7 @@ class RecordingService : Service() {
         private const val STORAGE_CHECK_MS = 10_000L
         private const val UI_UPDATE_MS = 100L
         private const val NOTIFICATION_UPDATE_MS = 1_000L
-        private const val MAX_RECONNECT_ATTEMPTS = 3
+        private const val MAX_RECONNECT_ATTEMPTS = 6
     }
 
     private val running = AtomicBoolean(false)
@@ -266,7 +266,7 @@ class RecordingService : Service() {
                         var replacement: Pair<AudioRecord, Int>? = null
                         repeat(MAX_RECONNECT_ATTEMPTS) { attempt ->
                             if (replacement == null && running.get()) {
-                                if (attempt > 0) Thread.sleep(300L)
+                                if (attempt > 0) Thread.sleep(longArrayOf(0L, 1_000L, 2_000L, 4_000L, 8_000L, 15_000L)[attempt])
                                 replacement = runCatching { openMicrophone() }.getOrNull()
                             }
                         }
@@ -424,7 +424,7 @@ class RecordingService : Service() {
         val request = OneTimeWorkRequestBuilder<AiEnhanceWorker>()
             .setInputData(AiEnhanceWorker.input(id))
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .setBackoffCriteria(androidx.work.BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 15, TimeUnit.SECONDS)
             .build()
         WorkManager.getInstance(this).enqueueUniqueWork("mai-ai-$id", ExistingWorkPolicy.REPLACE, request)
     }

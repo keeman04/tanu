@@ -111,7 +111,8 @@ def transcription_keywords(participant_names: list[str]) -> list[str]:
 
 
 def language_hints() -> list[str]:
-    return ["ta", "en"]
+    # Legacy endpoint remains unbiased; production v2 accepts explicit per-meeting presets.
+    return []
 
 
 def run_ffmpeg(input_path: Path, output_dir: Path) -> list[Path]:

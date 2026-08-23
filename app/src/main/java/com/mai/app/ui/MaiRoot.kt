@@ -763,7 +763,7 @@ private fun SettingsPage(themeMode: Int, onTheme: (Int) -> Unit) {
                 }
             }
         }
-        item { SettingsCard("Speech & AI") { Text("Realtime Tamil + English/Tanglish preview", fontWeight = FontWeight.SemiBold); Text("Live transcription is only a preview. The complete saved audio is reprocessed after Stop for the final English transcript and MOM.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) } }
+        item { SettingsCard("Speech & AI") { Text("Realtime multilingual preview · Auto detect", fontWeight = FontWeight.SemiBold); Text("Live transcription is only a preview. Auto mode does not force a language. The complete saved audio is processed on the MAI server with resumable multilingual transcription, then converted into the final English transcript and MOM.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) } }
         item { SettingsCard("Recording safety") { Text("15-second recoverable audio chunks · screen-off foreground recording · storage monitoring · microphone interruption detection", fontSize = 12.sp) } }
         item { SettingsCard("Privacy") { Text("Original audio is protected locally on this device. When AI processing is configured, meeting audio is sent over HTTPS to the MAI backend for transcription and MOM generation. The permanent OpenAI API key is never stored in the app.", fontSize = 13.sp) } }
     }
