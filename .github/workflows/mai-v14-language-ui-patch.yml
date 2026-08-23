@@ -1,0 +1,96 @@
+name: MAI V1.4 language UI patch
+on:
+  push:
+    branches: [ mai-v1.1-tamil ]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mai-v1.1-tamil
+          fetch-depth: 0
+      - name: Add selectable language presets to Settings
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('app/src/main/java/com/mai/app/ui/MaiRoot.kt')
+          text = path.read_text()
+
+          old = '''    var retention by remember { mutableIntStateOf(prefs.getInt("audio_retention_days", 7)) }
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {'''
+          new = '''    var retention by remember { mutableIntStateOf(prefs.getInt("audio_retention_days", 7)) }
+    var languageMode by remember { mutableStateOf(prefs.getString("transcription_language_mode", "auto") ?: "auto") }
+    val languageChoices = listOf(
+        "auto" to "Auto detect",
+        "ta_en" to "Tamil + English",
+        "hi_en" to "Hindi + English",
+        "te_en" to "Telugu + English",
+        "ml_en" to "Malayalam + English",
+        "kn_en" to "Kannada + English",
+        "bn_en" to "Bengali + English",
+        "mr_en" to "Marathi + English",
+        "gu_en" to "Gujarati + English",
+        "pa_en" to "Punjabi + English",
+        "ur_en" to "Urdu + English"
+    )
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {'''
+          if old not in text:
+              raise SystemExit('Settings state block not found')
+          text = text.replace(old, new, 1)
+
+          old = '''        item { SettingsCard("Speech & AI") { Text("Realtime multilingual preview · Auto detect", fontWeight = FontWeight.SemiBold); Text("Live transcription is only a preview. Auto mode does not force a language. The complete saved audio is processed on the MAI server with resumable multilingual transcription, then converted into the final English transcript and MOM.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)) } }'''
+          new = '''        item {
+            SettingsCard("Speech & AI") {
+                Text("Meeting language", fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Auto detect is recommended. Choose a preset only when a meeting is mainly in that language plus English; this gives transcription an extra hint without changing the final English MOM.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)
+                )
+                Spacer(Modifier.height(9.dp))
+                languageChoices.chunked(2).forEach { pair ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        pair.forEach { (mode, label) ->
+                            if (languageMode == mode) {
+                                Button(
+                                    onClick = {},
+                                    modifier = Modifier.weight(1f),
+                                    contentPadding = PaddingValues(horizontal = 7.dp, vertical = 8.dp)
+                                ) { Text(label, fontSize = 11.sp) }
+                            } else {
+                                OutlinedButton(
+                                    onClick = {
+                                        languageMode = mode
+                                        prefs.edit().putString("transcription_language_mode", mode).apply()
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    contentPadding = PaddingValues(horizontal = 7.dp, vertical = 8.dp)
+                                ) { Text(label, fontSize = 11.sp) }
+                            }
+                        }
+                        if (pair.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                    Spacer(Modifier.height(5.dp))
+                }
+                Text(
+                    "Live transcription is a preview only. The complete saved audio is uploaded resumably and reprocessed for the verified English transcript and structured MOM.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = .5f)
+                )
+            }
+        }'''
+          if old not in text:
+              raise SystemExit('Speech & AI settings block not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Remove one-time workflow and commit
+        run: |
+          rm -f .github/workflows/mai-v14-language-ui-patch.yml
+          git config user.name "MAI CI"
+          git config user.email "actions@users.noreply.github.com"
+          git add app/src/main/java/com/mai/app/ui/MaiRoot.kt .github/workflows/mai-v14-language-ui-patch.yml
+          git commit -m "Expose multilingual language presets in Settings"
+          git push origin HEAD:mai-v1.1-tamil
