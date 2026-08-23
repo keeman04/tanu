@@ -11,6 +11,7 @@ import androidx.work.WorkManager
 import com.mai.app.data.MaiDb
 import com.mai.app.intelligence.AiEnhanceWorker
 import com.mai.app.recording.RecoverableAudioWriter
+import com.mai.app.recording.RecordingRestartGuard
 import com.mai.app.retention.AudioRetentionWorker
 import java.io.File
 import java.util.concurrent.Executors
@@ -37,7 +38,21 @@ class MaiApplication : Application() {
         recoveryExecutor.execute {
             runCatching {
                 val db = MaiDb(this)
-                db.recoverInterruptedMeetings()
+
+                // Application starts before a redelivered foreground service after process
+                // death. Give Android a short window to restart the recorder and refresh its
+                // persistent heartbeat. Only recover/finish the meeting if no fresh heartbeat
+                // appears. RecordingService also refuses to redeliver a meeting whose DB state
+                // was already changed, closing the opposite side of this race.
+                val restartCandidate = RecordingRestartGuard.activeMeetingId(this)
+                if (restartCandidate != null) Thread.sleep(12_000L)
+                val recordingResumed = restartCandidate != null &&
+                    RecordingRestartGuard.isFresh(this, restartCandidate, 15_000L)
+                if (!recordingResumed) {
+                    restartCandidate?.let { RecordingRestartGuard.clear(this, it) }
+                    db.recoverInterruptedMeetings()
+                }
+
                 val retentionDays = settings.getInt("audio_retention_days", 7)
                 val backendConfigured = BuildConfig.MAI_BACKEND_URL.isNotBlank()
 
