@@ -69,7 +69,9 @@ def choose_boundaries(duration: float, silence_points: list[float]) -> list[floa
     search_radius = min(60.0, max(20.0, SEGMENT_SECONDS * 0.12))
     minimum_segment = min(120.0, SEGMENT_SECONDS * 0.4)
 
-    while current + SEGMENT_SECONDS < duration:
+    # Do not create a boundary when it would leave a tiny tail segment. In that case the
+    # final part is allowed to run longer than the nominal target, preserving context.
+    while current + SEGMENT_SECONDS + minimum_segment < duration:
         target = current + SEGMENT_SECONDS
         candidates = [
             point for point in silence_points
