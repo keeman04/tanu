@@ -6,6 +6,7 @@ with per-device session authentication, and adds persistent resumable meeting jo
 
 import app as core
 import jobs
+from accuracy import install as install_accuracy
 from device_auth import require_auth, router as auth_router
 from job_cleanup import cleanup_once, start_cleanup_loop
 from job_segmentation import segment_audio
@@ -18,6 +19,9 @@ core.require_auth = require_auth
 # V1.4 prefers a real silence near the ~7 minute target, retaining 5 seconds of overlap.
 # If silence detection fails, job_segmentation deterministically falls back to time boundaries.
 jobs._segment_audio = segment_audio
+# Production accuracy mode verifies every final-audio STT chunk independently. It uses a
+# second acoustic model and a targeted third pass only when the independent passes disagree.
+install_accuracy(jobs)
 core.app.include_router(auth_router)
 core.app.include_router(jobs_router)
 core.app.include_router(realtime_router)
